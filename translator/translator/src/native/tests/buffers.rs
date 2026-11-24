@@ -14566,6 +14566,109 @@ declare { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1 } @a
 }
 
 #[test]
+fn native_multi_root_raw_pointer_phi_reads_both_buffers_in_guarded_branches() {
+    // Models llama.cpp's kernel_concat: two raw device buffers (src0, src1) merged via a
+    // pointer phi before loading as float and storing into dst.
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @kernel_concat(ptr addrspace(1) %src0, ptr addrspace(1) %src1, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %cond = icmp ult i32 %tid, 16
+  br i1 %cond, label %from0, label %from1
+
+from0:
+  %off0 = shl i32 %tid, 2
+  %off0_64 = zext i32 %off0 to i64
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src0, i64 %off0_64
+  br label %merge
+
+from1:
+  %sub = sub i32 %tid, 16
+  %off1 = shl i32 %sub, 2
+  %off1_64 = zext i32 %off1 to i64
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %src1, i64 %off1_64
+  br label %merge
+
+merge:
+  %x = phi ptr addrspace(1) [ %p0, %from0 ], [ %p1, %from1 ]
+  %val = load float, ptr addrspace(1) %x, align 4
+  %dst_off = shl i32 %tid, 2
+  %dst_off_64 = zext i32 %dst_off to i64
+  %dp = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %dst_off_64
+  store float %val, ptr addrspace(1) %dp, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel_concat, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src0"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src1"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"dst"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("kernel_concat multi-root raw pointer phi must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        asm.contains("OpDecorate") && asm.contains("Binding 0") && asm.contains("Binding 1"),
+        "both src0 and src1 bindings must be referenced, not collapsed to a Private zero dummy:\n{asm}"
+    );
+    assert!(
+        !asm.contains("OpVariable %_ptr_Private_"),
+        "multi-root raw phi must not synthesize a Private zero placeholder:\n{asm}"
+    );
+}
+
+#[test]
+fn native_multi_root_raw_pointer_select_and_chained_gep() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @kernel_concat_select(ptr addrspace(1) %src0, ptr addrspace(1) %src1, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %cond = icmp ult i32 %tid, 16
+  %off = shl i32 %tid, 2
+  %off64 = zext i32 %off to i64
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src0, i64 %off64
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %src1, i64 %off64
+  %sel = select i1 %cond, ptr addrspace(1) %p0, ptr addrspace(1) %p1
+  %shifted = getelementptr inbounds i8, ptr addrspace(1) %sel, i64 4
+  %val = load float, ptr addrspace(1) %shifted, align 4
+  %dp = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %off64
+  store float %val, ptr addrspace(1) %dp, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel_concat_select, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src0"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src1"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"dst"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("multi-root raw pointer select must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        !asm.contains("OpVariable %_ptr_Private_"),
+        "multi-root raw select must not collapse to a Private zero dummy:\n{asm}"
+    );
+}
+
+#[test]
 fn native_helper_nullness_tracks_through_derived_gep_without_pointer_phis() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
