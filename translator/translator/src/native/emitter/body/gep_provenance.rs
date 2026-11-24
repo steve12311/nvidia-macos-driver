@@ -124,9 +124,13 @@ impl Emitter {
                 let pointee = gep_pointee(&parsed_source_ty, &gep.indices)?;
                 self.pointer_pointees
                     .insert(name.to_string(), pointee.clone());
-                if !self.pointer_phi_values.is_empty() {
+                if let Some(is_null) = self.pointer_nullness.get(base_name).copied() {
+                    self.record_pointer_nullness(name.to_string(), is_null);
+                } else if self.tracks_pointer_nullness() {
                     let is_null = self.const_bool(false)?;
                     self.record_pointer_nullness(name.to_string(), is_null);
+                }
+                if !self.pointer_phi_values.is_empty() {
                     self.materialize_raw_byte_index(name, &raw, true, instructions)?;
                     if self.raw_pointer_word_aligned(&raw) {
                         self.materialize_raw_word_index(name, &raw, true, instructions)?;
@@ -165,6 +169,8 @@ impl Emitter {
                     } else {
                         self.define_unmodeled_pointer_value(name, addrspace, &pointee)?;
                     }
+                } else {
+                    self.define_unmodeled_byte_pointer_value(name, addrspace)?;
                 }
                 return Ok(self.values.get(name).map(|(id, _)| *id));
             }
@@ -204,6 +210,12 @@ impl Emitter {
                     &gep.indices,
                     instructions,
                 )? {
+                    if let Some(storage) = self.pointer_storage.get(base_name).copied() {
+                        self.pointer_storage.insert(name.to_string(), storage);
+                    }
+                    if let Some(is_null) = self.pointer_nullness.get(base_name).copied() {
+                        self.record_pointer_nullness(name.to_string(), is_null);
+                    }
                     return Ok(None);
                 }
             }
@@ -475,7 +487,7 @@ impl Emitter {
                 .insert(name.to_string(), StorageClass::Function);
             self.pointer_pointees
                 .insert(name.to_string(), access_pointee);
-            if !self.pointer_phi_values.is_empty() {
+            if self.tracks_pointer_nullness() {
                 let is_null = self.const_bool(false)?;
                 self.record_pointer_nullness(name.to_string(), is_null);
             }
@@ -517,7 +529,7 @@ impl Emitter {
             self.pointer_pointees.insert(name.to_string(), pointee);
             self.raw_offsets.insert(name.to_string(), raw);
             self.unmodeled_pointers.insert(name.to_string());
-            if !self.pointer_phi_values.is_empty() {
+            if self.tracks_pointer_nullness() {
                 let is_null = self.const_bool(false)?;
                 self.record_pointer_nullness(name.to_string(), is_null);
             }
@@ -604,7 +616,7 @@ impl Emitter {
                     ));
                     self.pointer_storage.insert(name.to_string(), StorageClass::Workgroup);
                     self.pointer_pointees.insert(name.to_string(), lane_ty);
-                    if !self.pointer_phi_values.is_empty() {
+                    if self.tracks_pointer_nullness() {
                         let is_null = self.const_bool(false)?;
                         self.record_pointer_nullness(name.to_string(), is_null);
                     }
@@ -644,7 +656,7 @@ impl Emitter {
                     .insert(name.to_string(), access_storage);
                 self.pointer_pointees
                     .insert(name.to_string(), access_pointee.clone());
-                if !self.pointer_phi_values.is_empty() {
+                if self.tracks_pointer_nullness() {
                     let is_null = self.const_bool(false)?;
                     self.record_pointer_nullness(name.to_string(), is_null);
                 }
@@ -665,7 +677,13 @@ impl Emitter {
         }
         let pointee_points_to_aggregate =
             matches!(pointee, LlType::Array(_, _) | LlType::Struct(_));
-        let struct_base_stride = matches!(base_pointee.as_ref(), Some(LlType::Struct(_)));
+        let incompatible_aggregate_base = base_pointee.as_ref().is_some_and(|base_ty| {
+            base_points_to_aggregate && !types_compatible(base_ty, &source_ty)
+        });
+        let struct_base_stride = matches!(base_pointee.as_ref(), Some(LlType::Struct(_)))
+            && base_pointee
+                .as_ref()
+                .is_some_and(|base_ty| types_compatible(base_ty, &source_ty));
         let array_base_stride = matches!(base_pointee.as_ref(), Some(LlType::Array(_, _)))
             && base_pointee
                 .as_ref()
@@ -676,21 +694,20 @@ impl Emitter {
             &gep.base.value,
             LlValue::Local(base_name) if self.pointer_phi_values.contains(base_name)
         );
-        let use_ptr_access_chain = decide_ptr_access_chain(PtrAccessChainInputs {
-            pointee_points_to_aggregate,
-            base_storage: access_storage,
-            is_indexed_container_root: self.is_indexed_container_root(base, Some(access_storage)),
-            struct_base_stride,
-            array_base_stride,
-            first_index_nonzero,
-            was_composed,
-            base_is_param,
-            base_points_to_aggregate,
-            base_is_pointer_phi,
-        });
-        let incompatible_aggregate_base = base_pointee.as_ref().is_some_and(|base_ty| {
-            base_points_to_aggregate && !types_compatible(base_ty, &source_ty)
-        });
+        let use_ptr_access_chain = !incompatible_aggregate_base
+            && decide_ptr_access_chain(PtrAccessChainInputs {
+                pointee_points_to_aggregate,
+                base_storage: access_storage,
+                is_indexed_container_root: self
+                    .is_indexed_container_root(base, Some(access_storage)),
+                struct_base_stride,
+                array_base_stride,
+                first_index_nonzero,
+                was_composed,
+                base_is_param,
+                base_points_to_aggregate,
+                base_is_pointer_phi,
+            });
         let reinterpreted_workgroup_indices =
             if incompatible_aggregate_base && base_storage == StorageClass::Workgroup {
                 base_pointee.as_ref().map_or(Ok(None), |base_ty| {
@@ -757,13 +774,10 @@ impl Emitter {
             .insert(name.to_string(), access_pointee);
         if let LlValue::Local(base_name) = &gep.base.value {
             if let Some(is_null) = self.pointer_nullness.get(base_name).copied() {
-                let known_non_null = self.const_bool(false)?;
-                if is_null == known_non_null {
-                    self.record_pointer_nullness(name.to_string(), known_non_null);
-                }
+                self.record_pointer_nullness(name.to_string(), is_null);
             }
         }
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() && !self.pointer_nullness.contains_key(name) {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -883,7 +897,7 @@ impl Emitter {
         self.pointer_pointees
             .insert(name.to_string(), LlType::Int(8));
         self.byte_view_pointers.insert(name.to_string());
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -1113,7 +1127,7 @@ impl Emitter {
                 root_is_indexed_container: provenance.root_is_indexed_container,
             },
         );
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -1208,7 +1222,7 @@ impl Emitter {
                 root_is_indexed_container: provenance.root_is_indexed_container,
             },
         );
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -1318,7 +1332,7 @@ impl Emitter {
             .insert(name.to_string(), StorageClass::Private);
         self.pointer_pointees
             .insert(name.to_string(), pointee.clone());
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -1631,7 +1645,7 @@ impl Emitter {
             .insert(name.to_string(), StorageClass::Workgroup);
         self.pointer_pointees
             .insert(name.to_string(), source_ty.clone());
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -1793,7 +1807,9 @@ impl Emitter {
         };
         let ptr_type = self.ptr_type_id(StorageClass::Workgroup, &access_pointee)?;
         let result = self.result_id(name, &LlType::Ptr(addrspace))?;
-        let op = if self.is_workgroup_global_root(access_base) {
+        let op = if self.is_workgroup_global_root(access_base)
+            || self.is_workgroup_indexed_container_root(access_base)
+        {
             Op::InBoundsAccessChain
         } else {
             Op::PtrAccessChain
@@ -1807,7 +1823,7 @@ impl Emitter {
             .insert(name.to_string(), StorageClass::Workgroup);
         self.pointer_pointees
             .insert(name.to_string(), access_pointee.clone());
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }
@@ -1964,7 +1980,10 @@ impl Emitter {
                 .get(param)
                 .is_some_and(|(id, _)| *id == access_base)
         });
-        let use_ptr_access_chain = !access_base_is_param_root && !base_is_param;
+        let use_ptr_access_chain = !access_base_is_param_root
+            && !base_is_param
+            && !self.is_workgroup_global_root(access_base)
+            && !self.is_workgroup_indexed_container_root(access_base);
         let spirv_indices = if use_ptr_access_chain {
             access_indices.clone()
         } else {
@@ -1988,7 +2007,7 @@ impl Emitter {
             .insert(name.to_string(), StorageClass::Workgroup);
         self.pointer_pointees
             .insert(name.to_string(), elem.as_ref().clone());
-        if !self.pointer_phi_values.is_empty() {
+        if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }

@@ -167,9 +167,42 @@ impl Emitter {
                     instructions,
                 )?;
                 if let Some(provenance) = pointer_provenance.clone() {
-                    self.gep_provenance.insert(name.clone(), provenance);
-                    if let Some(meta) = pointer_meta {
+                    let storage = pointer_meta
+                        .as_ref()
+                        .map(|m| m.storage)
+                        .unwrap_or(StorageClass::Function);
+                    let pointee = pointer_meta
+                        .as_ref()
+                        .and_then(|m| m.pointee.clone())
+                        .or_else(|| self.tir_use_pointees.get(&name).cloned());
+                    if let Some(pointee) = pointee {
+                        let result_type = self.ptr_type_id(storage, &pointee)?;
+                        let result = self.result_id(&name, &result_ty)?;
+                        let mut operands = vec![Operand::IdRef(provenance.root)];
+                        for index in gep_spirv_indices(&provenance.indices)? {
+                            operands.push(Operand::IdRef(self.value_id(&index.value, &index.ty)?));
+                        }
+                        let op = if operands.len() == 1 {
+                            Op::CopyObject
+                        } else {
+                            Op::InBoundsAccessChain
+                        };
+                        instructions.push(Self::inst(op, Some(result_type), Some(result), operands));
+                        self.record_pointer_meta(
+                            name.clone(),
+                            PointerMeta {
+                                storage,
+                                pointee: Some(pointee),
+                            },
+                        );
+                    } else if let Some(meta) = pointer_meta {
                         self.record_pointer_meta(name.clone(), meta);
+                    }
+                    self.gep_provenance.insert(name.clone(), provenance);
+                    if self.tracks_pointer_nullness() && !self.pointer_nullness.contains_key(&name)
+                    {
+                        let is_null = self.const_bool(false)?;
+                        self.record_pointer_nullness(name, is_null);
                     }
                     return Ok(());
                 }
@@ -661,7 +694,7 @@ impl Emitter {
                 is_null
             };
             self.record_pointer_nullness(name.to_string(), is_null);
-        } else if !self.pointer_phi_values.is_empty() {
+        } else if self.tracks_pointer_nullness() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);
         }

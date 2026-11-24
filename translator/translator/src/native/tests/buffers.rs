@@ -14564,3 +14564,95 @@ declare { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1 } @a
     );
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
 }
+
+#[test]
+fn native_helper_nullness_tracks_through_derived_gep_without_pointer_phis() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %buf, ptr addrspace(1) %out, i1 %use_null, i1 %choose, i64 %off) {
+entry:
+  %p = getelementptr inbounds i8, ptr addrspace(1) %buf, i64 4
+  %a = call i1 @mid(ptr addrspace(1) %p, i1 %choose, i64 %off)
+  %b = call i1 @mid(ptr addrspace(1) null, i1 %choose, i64 %off)
+  %r = select i1 %use_null, i1 %b, i1 %a
+  %w = zext i1 %r to i32
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+define internal i1 @mid(ptr addrspace(1) %p, i1 %choose, i64 %off) {
+entry:
+  br i1 %choose, label %go, label %skip
+go:
+  %q = getelementptr i8, ptr addrspace(1) %p, i64 %off
+  %res = call i1 @leaf(ptr addrspace(1) %q, i1 %choose)
+  ret i1 %res
+skip:
+  ret i1 false
+}
+
+define internal i1 @leaf(ptr addrspace(1) %x, i1 %choose) {
+entry:
+  br i1 %choose, label %check, label %skip
+check:
+  %isnull = icmp eq ptr addrspace(1) %x, null
+  ret i1 %isnull
+skip:
+  ret i1 false
+}
+"#;
+    let spv = emit_vulkan_spirv(ll)
+        .expect("transitive helper nullness through GEP without pointer phis must succeed");
+    let module = load_bytes(&spv).expect("load native SPIR-V");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        module.functions.iter().any(|f| f.parameters.len() == 4)
+            && module.functions.iter().any(|f| f.parameters.len() == 3),
+        "both @mid (4 params) and @leaf (3 params) must receive the nullness shadow parameter:\n{asm}"
+    );
+    assert!(asm.contains("OpConstantTrue"), "{asm}");
+    assert!(asm.contains("OpConstantFalse"), "{asm}");
+}
+
+#[test]
+fn native_ptr_access_chain_contract_on_struct_buffer_and_function_alloca() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %scratch = alloca [4 x float], align 4
+  %s0 = getelementptr inbounds [4 x float], ptr %scratch, i32 0, i32 0
+  store float 1.0, ptr %s0, align 4
+  %s1 = getelementptr inbounds [4 x float], ptr %scratch, i32 0, i32 1
+  store float 2.0, ptr %s1, align 4
+  %c = icmp eq i32 %tid, 0
+  %psel = select i1 %c, ptr %s0, ptr %s1
+  %lv = load float, ptr %psel, align 4
+  %idx64 = zext i32 %tid to i64
+  %sp = getelementptr inbounds float, ptr addrspace(1) %src, i64 %idx64
+  %sv = load float, ptr addrspace(1) %sp, align 4
+  %sum = fadd float %lv, %sv
+  %dp = getelementptr inbounds float, ptr addrspace(1) %dst, i64 %idx64
+  store float %sum, ptr addrspace(1) %dp, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("Function alloca select with provenance and StorageBuffer GEP must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpStore"), "{asm}");
+}
