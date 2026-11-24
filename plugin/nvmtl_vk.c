@@ -437,6 +437,8 @@ static int g_compute_unchecked;   /* compute pipelines skip buffer bounds checks
  * buffer's end (Apple GPUs tolerate it) then reads mapped memory instead of faulting the channel. Pool sub-allocations
  * already have mapped neighbours; this covers the end of each standalone allocation and each pool block.
  * NVMTL_BUF_GUARD=<bytes> overrides the 64 KB. */
+static uint64_t g_max_alloc_size;
+static uint64_t g_max_buffer_size;
 static VkDeviceSize nvmtl_buf_guard(void)
 {
     static long long g = -1;
@@ -1182,11 +1184,16 @@ static int nvmtl_vk_initialize(void)
     snprintf(g_name, sizeof g_name, "%s", pp.deviceName);
     g_lim = pp.limits;
     { VkPhysicalDeviceShaderSMBuiltinsPropertiesNV sm = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV };
-      VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sm };
+      VkPhysicalDeviceMaintenance3Properties m3 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, &sm };
+      VkPhysicalDeviceMaintenance4Properties m4 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES, &m3 };
+      VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m4 };
       pvkGetPhysicalDeviceProperties2(g_pdev, &p2); g_sm_count = sm.shaderSMCount;
-      nvlog("vk: limits — image array layers %u, shared memory %u B, workgroup %ux%ux%u (%u invocations), SMs %u",
+      g_max_alloc_size = m3.maxMemoryAllocationSize;
+      g_max_buffer_size = m4.maxBufferSize;
+      nvlog("vk: limits — image array layers %u, shared memory %u B, workgroup %ux%ux%u (%u invocations), SMs %u, maxAlloc %llu MB, maxBuffer %llu MB",
             g_lim.maxImageArrayLayers, g_lim.maxComputeSharedMemorySize, g_lim.maxComputeWorkGroupSize[0], g_lim.maxComputeWorkGroupSize[1],
-            g_lim.maxComputeWorkGroupSize[2], g_lim.maxComputeWorkGroupInvocations, g_sm_count); }
+            g_lim.maxComputeWorkGroupSize[2], g_lim.maxComputeWorkGroupInvocations, g_sm_count,
+            (unsigned long long)(g_max_alloc_size >> 20), (unsigned long long)(g_max_buffer_size >> 20)); }
     pvkGetPhysicalDeviceMemoryProperties(g_pdev, &g_memp);
 
     uint32_t qn = 0; pvkGetPhysicalDeviceQueueFamilyProperties(g_pdev, &qn, NULL);
@@ -1687,6 +1694,18 @@ void nvmtl_vk_pubcaps(uint32_t *color_samples, uint32_t *depth_samples, uint64_t
     }
 }
 
+uint64_t nvmtl_vk_max_buffer_bytes(void) {
+    if (g_state != 1) return 0;
+    uint64_t cap = (uint64_t)g_lim.maxStorageBufferRange;
+    if (g_max_buffer_size && (!cap || g_max_buffer_size < cap)) cap = g_max_buffer_size;
+    if (g_max_alloc_size) {
+        const uint64_t guard = (uint64_t)nvmtl_buf_guard();
+        const uint64_t usable = g_max_alloc_size > guard ? g_max_alloc_size - guard : 0;
+        if (!cap || usable < cap) cap = usable;
+    }
+    return cap & ~0x3fffULL;
+}
+
 static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
 {
     if (want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
@@ -2082,6 +2101,11 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
     if (nvmtl_opaque_CreateBuffer(g_dev, &bci, NULL, &out->buf) != VK_SUCCESS) {
         nvlog("vk: vkCreateBuffer refused an external-memory buffer of %zu bytes", size); out->buf = NULL; return -1; }
     VkMemoryRequirements mr; pvkGetBufferMemoryRequirements(g_dev, (VkBuffer)out->buf, &mr);
+    if (mr.size > size) {
+        nvlog("vk: host-pointer import refused — buffer requires %llu bytes > host range %zu bytes",
+              (unsigned long long)mr.size, size);
+        pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL); out->buf = NULL; return -1;
+    }
     int mt = memtype(mr.memoryTypeBits & mhp.memoryTypeBits,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (mt < 0) { nvlog("vk: no host-visible memory type is both importable and valid for this buffer");
@@ -4513,6 +4537,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         VkDescriptorBufferInfo ai;
         if (covered && samePage && !c->icb_slot && (!table || !nvmtl_address_snapshot(c, which, &ai))) {
             if (table) t->lastdyn[which] = (uint32_t)ai.offset;
+            t->lastw[which][0] &= ~(t->chg[which][0] & 0xffffffffull);
             t->dirty[which] = 0; memset(t->chg[which], 0, sizeof t->chg[which]);
             c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
             nvmtl_enc78_count(E78C_SETREUSE, 1);
