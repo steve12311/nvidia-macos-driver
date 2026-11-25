@@ -676,7 +676,21 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
             if inst.opcode == "phi" && matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1))) {
                 return inst.result.as_deref().is_some_and(has_multi_root_raw);
             }
-            false
+            inst.call().as_deref().is_some_and(|call| {
+                let ptr_idx = if call.callee.starts_with("air.simdgroup_matrix_8x8_load.") {
+                    Some(0usize)
+                } else if call.callee.starts_with("air.simdgroup_matrix_8x8_store.") {
+                    Some(1usize)
+                } else {
+                    None
+                };
+                ptr_idx
+                    .and_then(|i| call.args.get(i))
+                    .is_some_and(|arg| match &arg.value {
+                        LlValue::Local(name) => has_multi_root_raw(name),
+                        _ => false,
+                    })
+            })
         }) {
             return true;
         }

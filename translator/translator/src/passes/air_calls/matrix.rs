@@ -2,6 +2,9 @@ use super::*;
 use crate::air_intrinsics::{
     matrix16_intrinsic, Matrix16Element, Matrix16Intrinsic, Matrix8Intrinsic,
 };
+use crate::passes::access::{
+    is_unsigned_byte_scalar, raw_byte_pointer_load_shape, RAW_BYTE_POINTER_ELEMENT_BITS,
+};
 
 pub(in crate::passes) fn is_half_scalar(ctx: &Ctx, ty: Word) -> bool {
     type_def_of(ctx, ty)
@@ -1241,7 +1244,10 @@ fn mat8_cm_ptr(defs: &HashMap<Word, &Instruction>, p: Word, depth: u32) -> Optio
                 (Op::TypeArray, Some(Operand::IdRef(e))) => *e,
                 _ => return None,
             };
-            if !matches!(defs.get(&elem)?.class.opcode, Op::TypeFloat | Op::TypeInt) {
+            let elem_def = defs.get(&elem)?;
+            if elem_def.class.opcode != Op::TypeFloat
+                || elem_def.operands.first() != Some(&Operand::LiteralBit32(16))
+            {
                 return None;
             }
             Some((var, mat8_cm_int(defs, idx, 0)))
@@ -3044,9 +3050,92 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_init_filled(
     Ok(insts)
 }
 
+#[derive(Clone, Copy)]
+enum MatrixBaseIndexing {
+    Ptr,
+    Array,
+    StructArray,
+}
+
+impl MatrixBaseIndexing {
+    fn emit_ptr(
+        self,
+        ctx: &mut Ctx,
+        insts: &mut Vec<Instruction>,
+        ptr_ty: Word,
+        base: Word,
+        index: Word,
+    ) -> Word {
+        let (op, operands) = match self {
+            MatrixBaseIndexing::Ptr => (
+                Op::PtrAccessChain,
+                vec![Operand::IdRef(base), Operand::IdRef(index)],
+            ),
+            MatrixBaseIndexing::Array => (
+                Op::AccessChain,
+                vec![Operand::IdRef(base), Operand::IdRef(index)],
+            ),
+            MatrixBaseIndexing::StructArray => {
+                let zero = ctx.const_uint(0);
+                (
+                    Op::AccessChain,
+                    vec![
+                        Operand::IdRef(base),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(index),
+                    ],
+                )
+            }
+        };
+        let elem_ptr = ctx.module.fresh_id();
+        insts.push(Instruction::new(op, Some(ptr_ty), Some(elem_ptr), operands));
+        elem_ptr
+    }
+}
+
 enum MatrixBlockBase {
-    Element,
-    Block(Word),
+    Direct {
+        indexing: MatrixBaseIndexing,
+        ptr_ty: Word,
+        physical_align: Option<u32>,
+    },
+    ByteView {
+        indexing: MatrixBaseIndexing,
+        ptr_ty: Word,
+        elem_bytes: u32,
+    },
+    WordView {
+        indexing: MatrixBaseIndexing,
+        storage: StorageClass,
+        ptr_ty: Word,
+        elem_bytes: u32,
+    },
+}
+
+fn unwrap_matrix_container(ctx: &Ctx, pointee: Word) -> (MatrixBaseIndexing, Word) {
+    let array_elem = |ty: Word| {
+        type_def_of(ctx, ty).and_then(|def| match def.operands.first() {
+            Some(Operand::IdRef(id))
+                if matches!(def.class.opcode, Op::TypeArray | Op::TypeRuntimeArray) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+    };
+    if let Some(cell) = array_elem(pointee) {
+        return (MatrixBaseIndexing::Array, cell);
+    }
+    if let Some(def) = type_def_of(ctx, pointee) {
+        if def.class.opcode == Op::TypeStruct && def.operands.len() == 1 {
+            if let Some(Operand::IdRef(field)) = def.operands.first() {
+                if let Some(cell) = array_elem(*field) {
+                    return (MatrixBaseIndexing::StructArray, cell);
+                }
+            }
+        }
+    }
+    (MatrixBaseIndexing::Ptr, pointee)
 }
 
 fn simdgroup_matrix_block_base(
@@ -3058,18 +3147,58 @@ fn simdgroup_matrix_block_base(
 ) -> Result<MatrixBlockBase, String> {
     let pointee = pointer_pointee_type(ctx, ptr_ty)
         .ok_or_else(|| format!("air.simdgroup_matrix {what} pointer is not a pointer"))?;
+    let physical_align = |ctx: &Ctx, storage: Option<StorageClass>, elem: Word| {
+        if storage != Some(StorageClass::PhysicalStorageBuffer) {
+            return None;
+        }
+        let bits = match type_def_of(ctx, elem)
+            .and_then(|d| match (d.class.opcode, d.operands.first()) {
+                (Op::TypeFloat | Op::TypeInt, Some(Operand::LiteralBit32(bits))) if *bits >= 8 => {
+                    Some(*bits)
+                }
+                _ => None,
+            }) {
+            Some(bits) => bits,
+            None => 32,
+        };
+        Some((bits / 8).max(1))
+    };
+    let storage = pointer_storage_class(ctx, ptr_ty);
     if pointee == elem {
-        return Ok(MatrixBlockBase::Element);
+        return Ok(MatrixBlockBase::Direct {
+            indexing: MatrixBaseIndexing::Ptr,
+            ptr_ty,
+            physical_align: physical_align(ctx, storage, elem),
+        });
     }
-    let is_block_of_elem = type_def_of(ctx, pointee)
-        .map(|def| {
-            matches!(def.class.opcode, Op::TypeArray | Op::TypeRuntimeArray)
-                && def.operands.first() == Some(&Operand::IdRef(elem))
-        })
-        .unwrap_or(false);
-    if is_block_of_elem {
-        if let Some(storage) = pointer_storage_class(ctx, ptr_ty) {
-            return Ok(MatrixBlockBase::Block(ctx.ty_ptr(storage, elem)));
+    if let Some(storage) = storage {
+        let (indexing, cell_ty) = unwrap_matrix_container(ctx, pointee);
+        if cell_ty == elem {
+            return Ok(MatrixBlockBase::Direct {
+                indexing,
+                ptr_ty: ctx.ty_ptr(storage, elem),
+                physical_align: physical_align(ctx, Some(storage), elem),
+            });
+        }
+        if matches!(storage, StorageClass::Workgroup | StorageClass::StorageBuffer) {
+            if let Some((_, 1, bits)) = raw_byte_pointer_load_shape(ctx, elem) {
+                let elem_bytes = bits / RAW_BYTE_POINTER_ELEMENT_BITS;
+                if is_unsigned_byte_scalar(ctx, cell_ty) {
+                    return Ok(MatrixBlockBase::ByteView {
+                        indexing,
+                        ptr_ty: ctx.ty_ptr(storage, cell_ty),
+                        elem_bytes,
+                    });
+                }
+                if is_int_scalar_width(ctx, cell_ty, 32) && matches!(elem_bytes, 2 | 4) {
+                    return Ok(MatrixBlockBase::WordView {
+                        indexing,
+                        storage,
+                        ptr_ty: ctx.ty_ptr(storage, cell_ty),
+                        elem_bytes,
+                    });
+                }
+            }
         }
     }
     let got = type_def_of(ctx, pointee)
@@ -3081,6 +3210,308 @@ fn simdgroup_matrix_block_base(
     Err(format!(
         "air.simdgroup_matrix {what} pointee does not match {whose} element type (pointee %{pointee} = {got}; element %{elem} = {want})"
     ))
+}
+
+fn convert_int_scalar(
+    ctx: &mut Ctx,
+    insts: &mut Vec<Instruction>,
+    value: Word,
+    from_ty: Word,
+    to_ty: Word,
+) -> Word {
+    if from_ty == to_ty {
+        return value;
+    }
+    let same_width = type_def_of(ctx, from_ty)
+        .zip(type_def_of(ctx, to_ty))
+        .is_some_and(|(a, b)| {
+            a.class.opcode == Op::TypeInt
+                && b.class.opcode == Op::TypeInt
+                && a.operands.first() == b.operands.first()
+        });
+    unary_value(
+        ctx,
+        insts,
+        if same_width { Op::Bitcast } else { Op::UConvert },
+        to_ty,
+        value,
+    )
+}
+
+impl MatrixBlockBase {
+    fn accepts_byte_cursor(&self) -> bool {
+        matches!(
+            self,
+            MatrixBlockBase::ByteView { .. } | MatrixBlockBase::WordView { .. }
+        )
+    }
+
+    fn word_view_byte_offset(
+        ctx: &mut Ctx,
+        insts: &mut Vec<Instruction>,
+        address: &MatrixBlockAddress,
+        row: Word,
+        col: Word,
+        elem_bytes: u32,
+        byte_cursor: Option<Word>,
+    ) -> Word {
+        let uint = ctx.ty_uint();
+        let index = address.index(ctx, insts, row, col);
+        let index_u32 = convert_int_scalar(ctx, insts, index, address.idx_ty, uint);
+        let scaled = shift_with_const(
+            ctx,
+            insts,
+            Op::ShiftLeftLogical,
+            index_u32,
+            elem_bytes.trailing_zeros(),
+        );
+        match byte_cursor {
+            Some(cursor) => {
+                let cursor_ty = value_result_type(ctx, cursor).unwrap_or(uint);
+                let cursor_u32 = convert_int_scalar(ctx, insts, cursor, cursor_ty, uint);
+                binary_value(ctx, insts, Op::IAdd, uint, cursor_u32, scaled)
+            }
+            None => scaled,
+        }
+    }
+
+    fn load_cell(
+        &self,
+        ctx: &mut Ctx,
+        insts: &mut Vec<Instruction>,
+        address: &MatrixBlockAddress,
+        base: Word,
+        elem: Word,
+        row: Word,
+        col: Word,
+        byte_cursor: Option<Word>,
+    ) -> Word {
+        match *self {
+            MatrixBlockBase::Direct {
+                indexing,
+                ptr_ty,
+                physical_align,
+            } => {
+                let index = address.index(ctx, insts, row, col);
+                let elem_ptr = indexing.emit_ptr(ctx, insts, ptr_ty, base, index);
+                let value = ctx.module.fresh_id();
+                let mut operands = vec![Operand::IdRef(elem_ptr)];
+                if let Some(align) = physical_align {
+                    operands.push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
+                    operands.push(Operand::LiteralBit32(align));
+                }
+                insts.push(Instruction::new(
+                    Op::Load,
+                    Some(elem),
+                    Some(value),
+                    operands,
+                ));
+                value
+            }
+            MatrixBlockBase::ByteView {
+                indexing,
+                ptr_ty,
+                elem_bytes,
+            } => {
+                let index = address.index(ctx, insts, row, col);
+                let scale = ctx.const_int_of(address.idx_ty, i64::from(elem_bytes));
+                let mut byte_off = binary_value(ctx, insts, Op::IMul, address.idx_ty, index, scale);
+                if let Some(cursor) = byte_cursor {
+                    let cursor_ty = value_result_type(ctx, cursor).unwrap_or(address.idx_ty);
+                    let cursor_idx = convert_int_scalar(ctx, insts, cursor, cursor_ty, address.idx_ty);
+                    byte_off = binary_value(ctx, insts, Op::IAdd, address.idx_ty, cursor_idx, byte_off);
+                }
+                let elem_ptr = indexing.emit_ptr(ctx, insts, ptr_ty, base, byte_off);
+                let value = ctx.module.fresh_id();
+                insts.push(Instruction::new(
+                    Op::Load,
+                    Some(elem),
+                    Some(value),
+                    vec![Operand::IdRef(elem_ptr)],
+                ));
+                value
+            }
+            MatrixBlockBase::WordView {
+                indexing,
+                ptr_ty,
+                elem_bytes,
+                ..
+            } => {
+                let uint = ctx.ty_uint();
+                let byte_off = Self::word_view_byte_offset(
+                    ctx,
+                    insts,
+                    address,
+                    row,
+                    col,
+                    elem_bytes,
+                    byte_cursor,
+                );
+                let word_idx = shift_with_const(ctx, insts, Op::ShiftRightLogical, byte_off, 2);
+                let word_ptr = indexing.emit_ptr(ctx, insts, ptr_ty, base, word_idx);
+                let word_ty = pointer_pointee_type(ctx, ptr_ty).unwrap_or(uint);
+                let word = ctx.module.fresh_id();
+                insts.push(Instruction::new(
+                    Op::Load,
+                    Some(word_ty),
+                    Some(word),
+                    vec![Operand::IdRef(word_ptr)],
+                ));
+                if elem_bytes == 4 {
+                    if elem == word_ty {
+                        word
+                    } else {
+                        unary_value(ctx, insts, Op::Bitcast, elem, word)
+                    }
+                } else {
+                    ctx.add_capability(spirv::Capability::Int16);
+                    let word_u32 = convert_int_scalar(ctx, insts, word, word_ty, uint);
+                    let half_byte = bitwise_with_const(ctx, insts, Op::BitwiseAnd, uint, byte_off, 2);
+                    let bit_shift = shift_with_const(ctx, insts, Op::ShiftLeftLogical, half_byte, 3);
+                    let shifted = binary_value(ctx, insts, Op::ShiftRightLogical, uint, word_u32, bit_shift);
+                    let u16_ty = ctx.ty_int16();
+                    let lo16 = unary_value(ctx, insts, Op::UConvert, u16_ty, shifted);
+                    if elem == u16_ty {
+                        lo16
+                    } else {
+                        unary_value(ctx, insts, Op::Bitcast, elem, lo16)
+                    }
+                }
+            }
+        }
+    }
+
+    fn store_cell(
+        &self,
+        ctx: &mut Ctx,
+        insts: &mut Vec<Instruction>,
+        address: &MatrixBlockAddress,
+        base: Word,
+        elem: Word,
+        row: Word,
+        col: Word,
+        value: Word,
+        byte_cursor: Option<Word>,
+    ) {
+        match *self {
+            MatrixBlockBase::Direct {
+                indexing,
+                ptr_ty,
+                physical_align,
+            } => {
+                let index = address.index(ctx, insts, row, col);
+                let elem_ptr = indexing.emit_ptr(ctx, insts, ptr_ty, base, index);
+                let mut operands = vec![Operand::IdRef(elem_ptr), Operand::IdRef(value)];
+                if let Some(align) = physical_align {
+                    operands.push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
+                    operands.push(Operand::LiteralBit32(align));
+                }
+                insts.push(Instruction::new(Op::Store, None, None, operands));
+            }
+            MatrixBlockBase::ByteView {
+                indexing,
+                ptr_ty,
+                elem_bytes,
+            } => {
+                let index = address.index(ctx, insts, row, col);
+                let scale = ctx.const_int_of(address.idx_ty, i64::from(elem_bytes));
+                let mut byte_off = binary_value(ctx, insts, Op::IMul, address.idx_ty, index, scale);
+                if let Some(cursor) = byte_cursor {
+                    let cursor_ty = value_result_type(ctx, cursor).unwrap_or(address.idx_ty);
+                    let cursor_idx = convert_int_scalar(ctx, insts, cursor, cursor_ty, address.idx_ty);
+                    byte_off = binary_value(ctx, insts, Op::IAdd, address.idx_ty, cursor_idx, byte_off);
+                }
+                let elem_ptr = indexing.emit_ptr(ctx, insts, ptr_ty, base, byte_off);
+                insts.push(Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(elem_ptr), Operand::IdRef(value)],
+                ));
+            }
+            MatrixBlockBase::WordView {
+                indexing,
+                storage,
+                ptr_ty,
+                elem_bytes,
+            } => {
+                let uint = ctx.ty_uint();
+                let byte_off = Self::word_view_byte_offset(
+                    ctx,
+                    insts,
+                    address,
+                    row,
+                    col,
+                    elem_bytes,
+                    byte_cursor,
+                );
+                let word_idx = shift_with_const(ctx, insts, Op::ShiftRightLogical, byte_off, 2);
+                let word_ptr = indexing.emit_ptr(ctx, insts, ptr_ty, base, word_idx);
+                let word_ty = pointer_pointee_type(ctx, ptr_ty).unwrap_or(uint);
+                if elem_bytes == 4 {
+                    let word = if elem == word_ty {
+                        value
+                    } else {
+                        unary_value(ctx, insts, Op::Bitcast, word_ty, value)
+                    };
+                    insts.push(Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(word_ptr), Operand::IdRef(word)],
+                    ));
+                } else {
+                    ctx.add_capability(spirv::Capability::Int16);
+                    let u16_ty = ctx.ty_int16();
+                    let bits16 = if elem == u16_ty {
+                        value
+                    } else {
+                        unary_value(ctx, insts, Op::Bitcast, u16_ty, value)
+                    };
+                    let bits32 = unary_value(ctx, insts, Op::UConvert, uint, bits16);
+                    let half_byte = bitwise_with_const(ctx, insts, Op::BitwiseAnd, uint, byte_off, 2);
+                    let bit_shift = shift_with_const(ctx, insts, Op::ShiftLeftLogical, half_byte, 3);
+                    let placed = binary_value(ctx, insts, Op::ShiftLeftLogical, uint, bits32, bit_shift);
+                    let slot_mask_base = ctx.const_uint(0xffff);
+                    let slot_mask =
+                        binary_value(ctx, insts, Op::ShiftLeftLogical, uint, slot_mask_base, bit_shift);
+                    let clear_mask = unary_value(ctx, insts, Op::Not, uint, slot_mask);
+                    let clear_word = convert_int_scalar(ctx, insts, clear_mask, uint, word_ty);
+                    let placed_word = convert_int_scalar(ctx, insts, placed, uint, word_ty);
+                    let scope = ctx.const_uint(if storage == StorageClass::Workgroup {
+                        Scope::Workgroup as u32
+                    } else {
+                        Scope::Device as u32
+                    });
+                    let semantics = ctx.const_uint(0);
+                    let cleared = ctx.module.fresh_id();
+                    insts.push(Instruction::new(
+                        Op::AtomicAnd,
+                        Some(word_ty),
+                        Some(cleared),
+                        vec![
+                            Operand::IdRef(word_ptr),
+                            Operand::IdScope(scope),
+                            Operand::IdMemorySemantics(semantics),
+                            Operand::IdRef(clear_word),
+                        ],
+                    ));
+                    let updated = ctx.module.fresh_id();
+                    insts.push(Instruction::new(
+                        Op::AtomicOr,
+                        Some(word_ty),
+                        Some(updated),
+                        vec![
+                            Operand::IdRef(word_ptr),
+                            Operand::IdScope(scope),
+                            Operand::IdMemorySemantics(semantics),
+                            Operand::IdRef(placed_word),
+                        ],
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn pointer_storage_class(ctx: &Ctx, ptr_ty: Word) -> Option<StorageClass> {
@@ -3208,29 +3639,17 @@ fn binary(
     result
 }
 
-fn simdgroup_matrix_elem_ptr(
+fn matrix8_nv_coords(
     ctx: &mut Ctx,
     insts: &mut Vec<Instruction>,
-    ptr_ty: Word,
-    shape: &MatrixBlockBase,
-    address: &MatrixBlockAddress,
-    base: Word,
-    row: Word,
-    col: Word,
-) -> Word {
-    let index = address.index(ctx, insts, row, col);
-    let (op, result_ty) = match shape {
-        MatrixBlockBase::Element => (Op::PtrAccessChain, ptr_ty),
-        MatrixBlockBase::Block(elem_ptr_ty) => (Op::AccessChain, *elem_ptr_ty),
-    };
-    let elem_ptr = ctx.module.fresh_id();
-    insts.push(Instruction::new(
-        op,
-        Some(result_ty),
-        Some(elem_ptr),
-        vec![Operand::IdRef(base), Operand::IdRef(index)],
-    ));
-    elem_ptr
+    simd_lane: Word,
+) -> (Word, Word, Word) {
+    let uint = ctx.ty_uint();
+    let g = shift_with_const(ctx, insts, Op::ShiftRightLogical, simd_lane, 2);
+    let t = bitwise_with_const(ctx, insts, Op::BitwiseAnd, uint, simd_lane, 3);
+    let t2 = shift_with_const(ctx, insts, Op::ShiftLeftLogical, t, 1);
+    let t2p = bitwise_with_const(ctx, insts, Op::BitwiseOr, uint, t2, 1);
+    (g, t2, t2p)
 }
 
 fn descriptor_component(
@@ -3388,7 +3807,7 @@ fn simdgroup_matrix_address_for_call(
     insts: &mut Vec<Instruction>,
     trailing: &[Word],
     what: &str,
-) -> Result<MatrixBlockAddress, String> {
+) -> Result<(MatrixBlockAddress, Option<Word>), String> {
     let first = *trailing
         .first()
         .ok_or_else(|| format!("air.simdgroup_matrix_8x8_{what} has no descriptor operands"))?;
@@ -3398,11 +3817,29 @@ fn simdgroup_matrix_address_for_call(
         let strides = *trailing.get(1).ok_or_else(|| {
             format!("air.simdgroup_matrix_8x8_{what} descriptor ABI needs a stride vector")
         })?;
-        return simdgroup_matrix_address(ctx, insts, strides, trailing.get(2).copied());
+        let (origin, cursor) = match trailing.get(2).copied() {
+            Some(third)
+                if value_result_type(ctx, third)
+                    .and_then(|ty| composite_shape(ctx, ty))
+                    .is_some() =>
+            {
+                (Some(third), trailing.get(3).copied())
+            }
+            other => (None, other),
+        };
+        let address = simdgroup_matrix_address(ctx, insts, strides, origin)?;
+        return Ok((address, cursor));
     }
     match trailing {
-        [elements_per_row, origin, transpose, ..] => {
-            simdgroup_matrix_address_classic(ctx, insts, *elements_per_row, *origin, *transpose)
+        [elements_per_row, origin, transpose, rest @ ..] => {
+            let address = simdgroup_matrix_address_classic(
+                ctx,
+                insts,
+                *elements_per_row,
+                *origin,
+                *transpose,
+            )?;
+            Ok((address, rest.first().copied()))
         }
         _ => Err(format!(
             "air.simdgroup_matrix_8x8_{what} classic ABI expects (i64 elements_per_row, <2 x i64> origin, \
@@ -3434,47 +3871,48 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_load(
         .ok_or_else(|| "air.simdgroup_matrix load pointer has no type".to_string())?;
     let shape = simdgroup_matrix_block_base(ctx, ptr_ty, elem, "load", "result")?;
     let mut insts = Vec::new();
-    let address = simdgroup_matrix_address_for_call(ctx, &mut insts, &args[1..], "load")?;
+    let (address, byte_cursor) =
+        simdgroup_matrix_address_for_call(ctx, &mut insts, &args[1..], "load")?;
+    if byte_cursor.is_some() && !shape.accepts_byte_cursor() {
+        return Err(
+            "air.simdgroup_matrix_8x8_load received a trailing byte cursor on a typed pointer"
+                .to_string(),
+        );
+    }
     let lane = matrix8_lane(ctx, &mut insts);
     let mut slots = [0 as Word; 2];
     for slot in 0..2u32 {
         let col = matrix8_slot_col(ctx, &mut insts, &lane, slot);
-        let elem_ptr = simdgroup_matrix_elem_ptr(
-            ctx, &mut insts, ptr_ty, &shape, &address, base, lane.row, col,
+        slots[slot as usize] = shape.load_cell(
+            ctx,
+            &mut insts,
+            &address,
+            base,
+            elem,
+            lane.row,
+            col,
+            byte_cursor,
         );
-        let value = ctx.module.fresh_id();
-        insts.push(Instruction::new(
-            Op::Load,
-            Some(elem),
-            Some(value),
-            vec![Operand::IdRef(elem_ptr)],
-        ));
-        slots[slot as usize] = value;
     }
     if elem == ctx.ty_half() && std::env::var_os("NVMTL_MATRIX8_NO_DIRECT").is_none() {
-        let uint = ctx.ty_uint();
-        let g = shift_with_const(ctx, &mut insts, Op::ShiftRightLogical, lane.simd_lane, 2);
-        let t = bitwise_with_const(ctx, &mut insts, Op::BitwiseAnd, uint, lane.simd_lane, 3);
-        let t2 = shift_with_const(ctx, &mut insts, Op::ShiftLeftLogical, t, 1);
-        let t2p = bitwise_with_const(ctx, &mut insts, Op::BitwiseOr, uint, t2, 1);
+        let (g, t2, t2p) = matrix8_nv_coords(ctx, &mut insts, lane.simd_lane);
         for (role, cells) in [(MAT8_A, [(g, t2), (g, t2p)]), (MAT8_B, [(t2, g), (t2p, g)])] {
-            let mut e = [0 as Word; 2];
+            let mut values = [0 as Word; 2];
             for (slot, (row, col)) in cells.into_iter().enumerate() {
-                let elem_ptr = simdgroup_matrix_elem_ptr(
-                    ctx, &mut insts, ptr_ty, &shape, &address, base, row, col,
+                values[slot] = shape.load_cell(
+                    ctx,
+                    &mut insts,
+                    &address,
+                    base,
+                    elem,
+                    row,
+                    col,
+                    byte_cursor,
                 );
-                let value = ctx.module.fresh_id();
-                insts.push(Instruction::new(
-                    Op::Load,
-                    Some(elem),
-                    Some(value),
-                    vec![Operand::IdRef(elem_ptr)],
-                ));
-                e[slot] = value;
             }
-            mat8_nv_record(ctx, res, role, e, elem);
+            mat8_nv_record(ctx, res, role, values, elem);
             if role == MAT8_A {
-                mat8_nv_record(ctx, res, MAT8_C, e, elem);
+                mat8_nv_record(ctx, res, MAT8_C, values, elem);
             }
         }
     }
@@ -3505,27 +3943,22 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_store(
         .ok_or_else(|| "air.simdgroup_matrix store pointer has no type".to_string())?;
     let shape = simdgroup_matrix_block_base(ctx, ptr_ty, elem, "store", "value")?;
     let mut insts = Vec::new();
-    let address = simdgroup_matrix_address_for_call(ctx, &mut insts, &args[2..], "store")?;
+    let (address, byte_cursor) =
+        simdgroup_matrix_address_for_call(ctx, &mut insts, &args[2..], "store")?;
+    if byte_cursor.is_some() && !shape.accepts_byte_cursor() {
+        return Err(
+            "air.simdgroup_matrix_8x8_store received a trailing byte cursor on a typed pointer"
+                .to_string(),
+        );
+    }
     let lane = matrix8_lane(ctx, &mut insts);
     let (half, float) = (ctx.ty_half(), ctx.ty_float());
     if (elem == half || elem == float) && std::env::var_os("NVMTL_MATRIX8_NO_DIRECT").is_none() {
         if let Some(hit) = mat8_nv_cached(ctx, matrix, MAT8_C) {
-            let uint = ctx.ty_uint();
-            let g = shift_with_const(ctx, &mut insts, Op::ShiftRightLogical, lane.simd_lane, 2);
-            let t = bitwise_with_const(ctx, &mut insts, Op::BitwiseAnd, uint, lane.simd_lane, 3);
-            let t2 = shift_with_const(ctx, &mut insts, Op::ShiftLeftLogical, t, 1);
-            let t2p = bitwise_with_const(ctx, &mut insts, Op::BitwiseOr, uint, t2, 1);
+            let (g, t2, t2p) = matrix8_nv_coords(ctx, &mut insts, lane.simd_lane);
             for (slot, col) in [t2, t2p].into_iter().enumerate() {
                 let value = convert_matrix_lane(ctx, &mut insts, hit.e[slot], hit.elem, elem);
-                let elem_ptr = simdgroup_matrix_elem_ptr(
-                    ctx, &mut insts, ptr_ty, &shape, &address, base, g, col,
-                );
-                insts.push(Instruction::new(
-                    Op::Store,
-                    None,
-                    None,
-                    vec![Operand::IdRef(elem_ptr), Operand::IdRef(value)],
-                ));
+                shape.store_cell(ctx, &mut insts, &address, base, elem, g, col, value, byte_cursor);
             }
             return Ok(insts);
         }
@@ -3533,15 +3966,17 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_store(
     for slot in 0..2u32 {
         let value = composite_extract(ctx, &mut insts, elem, matrix, slot);
         let col = matrix8_slot_col(ctx, &mut insts, &lane, slot);
-        let elem_ptr = simdgroup_matrix_elem_ptr(
-            ctx, &mut insts, ptr_ty, &shape, &address, base, lane.row, col,
+        shape.store_cell(
+            ctx,
+            &mut insts,
+            &address,
+            base,
+            elem,
+            lane.row,
+            col,
+            value,
+            byte_cursor,
         );
-        insts.push(Instruction::new(
-            Op::Store,
-            None,
-            None,
-            vec![Operand::IdRef(elem_ptr), Operand::IdRef(value)],
-        ));
     }
     Ok(insts)
 }

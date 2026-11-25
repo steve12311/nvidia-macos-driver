@@ -2007,6 +2007,162 @@ entry:
 }
 
 #[test]
+fn native_simdgroup_matrix_reads_and_writes_byte_addressed_workgroup() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+@tile = internal addrspace(3) global [1024 x i8] undef, align 4
+
+define void @k(ptr addrspace(1) %out, i32 %thread) {
+entry:
+  %src = getelementptr [1024 x i8], ptr addrspace(3) @tile, i32 0, i32 8
+  %dst = getelementptr [1024 x i8], ptr addrspace(3) @tile, i32 0, i32 256
+  %m = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3) %src, <2 x i64> <i64 8, i64 8>, <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+  call void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float> %m, ptr addrspace(3) %dst, <2 x i64> <i64 8, i64 8>, <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+  %q = getelementptr i8, ptr addrspace(3) %dst, i32 %thread
+  %v = load i8, ptr addrspace(3) %q, align 1
+  store i8 %v, ptr addrspace(1) %out, align 1
+  ret void
+}
+
+declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"thread"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        Default::default(),
+    )
+    .expect("translate matrix load and store through byte pointers");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches(" Aligned 1").count(), 8, "{asm}");
+    assert_eq!(asm.matches("OpStore ").count(), 9, "{asm}");
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_simdgroup_matrix_reads_and_writes_raw_word_workgroup_with_byte_offset() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(3) %shmem, ptr addrspace(1) %out, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %fslot = getelementptr inbounds float, ptr addrspace(3) %shmem, i64 %idx
+  store float 1.000000e+00, ptr addrspace(3) %fslot, align 4
+  %hslot = getelementptr inbounds half, ptr addrspace(3) %shmem, i64 %idx
+  %hv = load half, ptr addrspace(3) %hslot, align 2
+  %mh_src = getelementptr inbounds half, ptr addrspace(3) %shmem, i64 64
+  %mh_dst = getelementptr inbounds half, ptr addrspace(3) %shmem, i64 129
+  %mh = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p3f16(ptr addrspace(3) %mh_src, i64 8, <2 x i64> zeroinitializer, i1 false)
+  call void @air.simdgroup_matrix_8x8_store.v64f16.p3f16(<64 x half> %mh, ptr addrspace(3) %mh_dst, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %mf_src = getelementptr inbounds i8, ptr addrspace(3) %shmem, i64 512
+  %mf_dst = getelementptr inbounds i8, ptr addrspace(3) %shmem, i64 768
+  %mf = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3) %mf_src, i64 8, <2 x i64> zeroinitializer, i1 false)
+  call void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float> %mf, ptr addrspace(3) %mf_dst, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %outp = getelementptr inbounds half, ptr addrspace(1) %out, i64 %idx
+  store half %hv, ptr addrspace(1) %outp, align 2
+  ret void
+}
+
+declare <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p3f16(ptr addrspace(3), i64, <2 x i64>, i1)
+declare void @air.simdgroup_matrix_8x8_store.v64f16.p3f16(<64 x half>, ptr addrspace(3), i64, <2 x i64>, i1)
+declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), i64, <2 x i64>, i1)
+declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), i64, <2 x i64>, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"shmem"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        Default::default(),
+    )
+    .expect("translate matrix load/store through raw-word workgroup buffer");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        asm.contains("OpAtomicAnd") && asm.contains("OpAtomicOr"),
+        "half matrix store to raw u32 workgroup must use atomic subword RMW:\n{asm}"
+    );
+    assert!(
+        !asm.contains("OpVariable %_ptr_Private_"),
+        "raw-word workgroup matrix pointer must not fall back to a Private zero dummy:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_simdgroup_matrix_reads_and_writes_bda_cross_binding_phi() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %pad, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %cond = icmp ult i32 %tid, 16
+  br i1 %cond, label %use_src, label %use_pad
+
+use_src:
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src, i64 16
+  br label %merge
+
+use_pad:
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %pad, i64 32
+  br label %merge
+
+merge:
+  %ptr = phi ptr addrspace(1) [ %p0, %use_src ], [ %p1, %use_pad ]
+  %m = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %ptr, i64 8, <2 x i64> zeroinitializer, i1 false)
+  call void @air.simdgroup_matrix_8x8_store.v64f16.p1f16(<64 x half> %m, ptr addrspace(1) %dst, i64 8, <2 x i64> zeroinitializer, i1 false)
+  ret void
+}
+
+declare <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1), i64, <2 x i64>, i1)
+declare void @air.simdgroup_matrix_8x8_store.v64f16.p1f16(<64 x half>, ptr addrspace(1), i64, <2 x i64>, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"pad"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"dst"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        Default::default(),
+    )
+    .expect("translate matrix load from BDA cross-binding pointer phi");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+    assert!(
+        !asm.contains("OpVariable %_ptr_Private_"),
+        "BDA matrix pointer must not fall back to a Private zero dummy:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_kernel_threadgroup_param_direct_scalar_load_uses_element_zero() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

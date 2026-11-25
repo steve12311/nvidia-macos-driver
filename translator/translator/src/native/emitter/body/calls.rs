@@ -564,7 +564,15 @@ impl Emitter {
             .unwrap_or_default();
         if callee_params.is_empty() {
             let texture_op = super::super::functions::is_air_texture_operation(&call.callee);
-            let mut ids = Vec::with_capacity(call.args.len());
+            let matrix_mem_ptr = if call.callee.starts_with("air.simdgroup_matrix_8x8_load.") {
+                Some((0usize, &call.ret))
+            } else if call.callee.starts_with("air.simdgroup_matrix_8x8_store.") {
+                call.args.first().map(|arg| (1usize, &arg.ty))
+            } else {
+                None
+            };
+            let mut ids = Vec::with_capacity(call.args.len() + 1);
+            let mut matrix_byte_cursor = None;
             // a whole-imageblock slice write (size flag false, size undef) gets its extent spelled out and the flag
             // set, so the slice writer copies that many cells instead of one
             let whole_extent = if call.callee.starts_with("air.write_imageblock_slice_to_texture")
@@ -577,6 +585,52 @@ impl Emitter {
                 None
             };
             for (index, arg) in call.args.iter().enumerate() {
+                if let Some((ptr_index, matrix_ty)) = matrix_mem_ptr {
+                    if index == ptr_index {
+                        if let LlValue::Local(arg_name) = &arg.value {
+                            if let Some(raw) = self.raw_offsets.get(arg_name).cloned() {
+                                if raw.unmodelable {
+                                    return Err(format!(
+                                        "native emitter: simdgroup_matrix pointer {arg_name} has an unmodelable raw offset"
+                                    ));
+                                }
+                                if raw.device_addr_base.is_some() {
+                                    let LlType::Vector(elem, 64) = self.resolve_type(matrix_ty)? else {
+                                        return Err(format!(
+                                            "native emitter: simdgroup_matrix BDA call {} has non-64-lane matrix type",
+                                            call.callee
+                                        ));
+                                    };
+                                    let address =
+                                        self.materialize_device_address(&raw, instructions)?;
+                                    let ptr_ty = self
+                                        .ptr_type_id(StorageClass::PhysicalStorageBuffer, &elem)?;
+                                    let ptr = self.fresh();
+                                    instructions.push(Self::inst(
+                                        Op::ConvertUToPtr,
+                                        Some(ptr_ty),
+                                        Some(ptr),
+                                        vec![Operand::IdRef(address)],
+                                    ));
+                                    self.used_device_address = true;
+                                    ids.push(ptr);
+                                    continue;
+                                }
+                                let root_id = self.raw_root_value_id(&raw)?;
+                                let byte_cursor =
+                                    self.emit_raw_byte_index(&raw, 0, instructions)?;
+                                ids.push(root_id);
+                                matrix_byte_cursor = Some(byte_cursor);
+                                continue;
+                            }
+                            if self.unmodeled_pointers.contains(arg_name) {
+                                return Err(format!(
+                                    "native emitter: simdgroup_matrix pointer {arg_name} is an unmodeled placeholder"
+                                ));
+                            }
+                        }
+                    }
+                }
                 if let Some(extent) = whole_extent {
                     if index == 2 {
                         ids.push(self.value_id_in(&LlValue::Bool(true), &arg.ty, instructions)?);
@@ -594,6 +648,9 @@ impl Emitter {
                     }
                 }
                 ids.push(self.value_id_in(&arg.value, &arg.ty, instructions)?);
+            }
+            if let Some(cursor) = matrix_byte_cursor {
+                ids.push(cursor);
             }
             return Ok(ids);
         }
