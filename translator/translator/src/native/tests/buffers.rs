@@ -15147,3 +15147,127 @@ entry:
     }
     let _ = std::fs::remove_dir_all(tmp);
 }
+
+#[test]
+fn native_bda_preserves_proven_vector_and_scalar_alignments() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %pad, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %off = mul i64 %idx, 64
+  %cond = icmp ult i32 %tid, 16
+  br i1 %cond, label %left, label %right
+
+left:
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src, i64 %off
+  br label %merge
+
+right:
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %pad, i64 %off
+  br label %merge
+
+merge:
+  %base = phi ptr addrspace(1) [ %p0, %left ], [ %p1, %right ]
+  %vf4 = load <4 x float>, ptr addrspace(1) %base, align 16
+  %p_h4 = getelementptr inbounds i8, ptr addrspace(1) %base, i64 16
+  %vh4 = load <4 x half>, ptr addrspace(1) %p_h4, align 8
+  %p_u16 = getelementptr inbounds i8, ptr addrspace(1) %base, i64 32
+  %vu16 = load i16, ptr addrspace(1) %p_u16, align 16
+  %p_sub = getelementptr inbounds i8, ptr addrspace(1) %base, i64 34
+  %vsub = load <2 x float>, ptr addrspace(1) %p_sub, align 2
+  %f0 = extractelement <4 x float> %vf4, i32 0
+  %h0 = extractelement <4 x half> %vh4, i32 0
+  %h0f = fpext half %h0 to float
+  %u16f = uitofp i16 %vu16 to float
+  %s0 = extractelement <2 x float> %vsub, i32 0
+  %a0 = fadd float %f0, %h0f
+  %a1 = fadd float %u16f, %s0
+  %sum = fadd float %a0, %a1
+  %outp = getelementptr inbounds float, ptr addrspace(1) %dst, i64 %idx
+  store float %sum, ptr addrspace(1) %outp, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"pad"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_preserve_align_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    let type_info = |ty: Word| -> Option<(Op, u32, u32)> {
+        let def = module
+            .types_global_values
+            .iter()
+            .find(|i| i.result_id == Some(ty))?;
+        match def.class.opcode {
+            Op::TypeFloat | Op::TypeInt => match def.operands.first() {
+                Some(Operand::LiteralBit32(bits)) => Some((def.class.opcode, *bits, 1)),
+                _ => None,
+            },
+            Op::TypeVector => match def.operands.as_slice() {
+                [Operand::IdRef(elem), Operand::LiteralBit32(lanes)] => {
+                    let elem_def = module
+                        .types_global_values
+                        .iter()
+                        .find(|i| i.result_id == Some(*elem))?;
+                    match elem_def.operands.first() {
+                        Some(Operand::LiteralBit32(bits)) => {
+                            Some((elem_def.class.opcode, *bits, *lanes))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut saw_v4f32_a16 = false;
+    let mut saw_v4f16_a8 = false;
+    let mut saw_u16_a16 = false;
+    let mut u16_a2_count = 0usize;
+    for inst in module.all_inst_iter() {
+        if inst.class.opcode != Op::Load {
+            continue;
+        }
+        let (Some(rty), [_, Operand::MemoryAccess(a), Operand::LiteralBit32(align)]) =
+            (inst.result_type, inst.operands.as_slice())
+        else {
+            continue;
+        };
+        if !a.contains(spirv::MemoryAccess::ALIGNED) {
+            continue;
+        }
+        if let Some((op, bits, lanes)) = type_info(rty) {
+            match (op, bits, lanes, *align) {
+                (Op::TypeFloat, 32, 4, 16) => saw_v4f32_a16 = true,
+                (Op::TypeFloat, 16, 4, 8) => saw_v4f16_a8 = true,
+                (Op::TypeInt, 16, 1, 16) => saw_u16_a16 = true,
+                (Op::TypeInt, 16, 1, 2) => u16_a2_count += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_v4f32_a16, "expected <4 x float> Aligned 16 load:\n{asm}");
+    assert!(saw_v4f16_a8, "expected <4 x half> Aligned 8 load:\n{asm}");
+    assert!(saw_u16_a16, "expected i16 Aligned 16 load:\n{asm}");
+    assert!(
+        u16_a2_count >= 4,
+        "expected subaligned <2 x float> align 2 to split into 4x u16 Aligned 2 loads:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}

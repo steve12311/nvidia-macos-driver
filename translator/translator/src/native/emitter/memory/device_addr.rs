@@ -429,12 +429,11 @@ impl Emitter {
         ty: &LlType,
         access_align: Option<u64>,
     ) -> u32 {
-        let natural = self.device_addr_align(ty);
+        // 保留 AIR 已证明的幂次对齐（用于 SPIR-V Aligned 与下游向量化），
+        // 仅在缺少显式对齐信息时回退到元素自然对齐，避免误声明高对齐。
         match access_align {
-            Some(a) if a > 0 && a.is_power_of_two() => {
-                natural.min(a.min(u32::MAX as u64) as u32)
-            }
-            _ => natural,
+            Some(a) if a > 0 && a.is_power_of_two() => a.min(1u64 << 30) as u32,
+            _ => self.device_addr_align(ty),
         }
     }
 
