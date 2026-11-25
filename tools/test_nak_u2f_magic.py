@@ -113,6 +113,11 @@ arm("nak_cg_possible_bits32 range analysis exists in nak_nir.c", "nak_cg_possibl
 arm("nak_cg_u2f_magic_instr accepts 32-bit range-proven u2f32 and i2f32",
     "alu->op != nir_op_u2f32 && alu->op != nir_op_i2f32" in patch_text
     and "nak_cg_alu_src_known_u23(alu, 0)" in patch_text)
+arm("nak_cg_u2f_magic_instr supports biased u23 fusion (Q6_K) and bounded signed i2f32",
+    "nak_cg_match_biased_u23(" in patch_text
+    and "nak_cg_alu_src_known_s23(" in patch_text
+    and "0x4B400000" in patch_text
+    and "-12582912.0" in patch_text)
 
 cc = shutil.which("cc") or shutil.which("clang")
 if not cc:
@@ -133,7 +138,7 @@ static uint32_t fill_below_msb(uint32_t m) {
 }
 
 int main(void) {
-    /* Exhaustive check: every integer in [0, 2^23 - 1] is bit-identical to (float)x */
+    /* Exhaustive check: every unsigned integer in [0, 2^23 - 1] is bit-identical to (float)x */
     for (uint32_t x = 0; x <= 0x7FFFFFu; x++) {
         float got = u2f(0x4B000000u | x) - 8388608.0f;
         float ref_u = (float)x;
@@ -143,18 +148,50 @@ int main(void) {
             return 1;
         }
     }
+    /* Exhaustive check: Q6_K biased u23 float(q - 32) = u2f(0x4B000000 | q) - 8388640.0f */
+    for (uint32_t q = 0; q <= 63u; q++) {
+        float got = u2f(0x4B000000u | q) - 8388640.0f;
+        float ref = (float)((int32_t)(int8_t)q - 32);
+        if (f2u(got) != f2u(ref)) {
+            fprintf(stderr, "q6k biased mismatch at q=%u\n", q);
+            return 2;
+        }
+    }
+    /* General biased u23 across representative negative/positive biases and full u16 range */
+    const int32_t biases[] = { -4194304, -32768, -128, -32, -1, 0, 1, 32, 128, 32767, 4194303 };
+    for (size_t bi = 0; bi < sizeof(biases) / sizeof(biases[0]); bi++) {
+        int32_t bias = biases[bi];
+        float offset = (float)((double)bias - 8388608.0);
+        for (uint32_t q = 0; q <= 65535u; q++) {
+            float got = u2f(0x4B000000u | q) + offset;
+            float ref = (float)((int32_t)q + bias);
+            if (f2u(got) != f2u(ref)) {
+                fprintf(stderr, "biased mismatch q=%u bias=%d\n", q, bias);
+                return 3;
+            }
+        }
+    }
+    /* Exhaustive check: every signed integer in [-2^22, 2^22 - 1] (including all int8/int16) */
+    for (int32_t x = -4194304; x <= 4194303; x++) {
+        float got = u2f(0x4B400000u + (uint32_t)x) - 12582912.0f;
+        float ref = (float)x;
+        if (f2u(got) != f2u(ref)) {
+            fprintf(stderr, "s23 mismatch at x=%d\n", x);
+            return 4;
+        }
+    }
     /* Q4_K masked nibble/shift ranges */
     const uint32_t q4k_masks[4] = { 0x000Fu, 0x00F0u, 0x0F00u, 0xF000u };
     for (int i = 0; i < 4; i++) {
-        if (q4k_masks[i] & ~0x7FFFFFu) return 2;
+        if (q4k_masks[i] & ~0x7FFFFFu) return 5;
     }
     /* Q6_K unpacked 6-bit value: (q1 & 0xF) | ((qh & 3) << 4) => 0x3F */
     uint32_t q6k_mask = (0xFFFFu & 0xFu) | ((0xFFu & 3u) << 4);
-    if (q6k_mask != 0x3Fu || (q6k_mask & ~0x7FFFFFu)) return 3;
+    if (q6k_mask != 0x3Fu || (q6k_mask & ~0x7FFFFFu)) return 6;
     /* umin bound check */
-    if ((fill_below_msb(0x8u) & fill_below_msb(0x7u)) != 0x7u) return 4;
+    if ((fill_below_msb(0x8u) & fill_below_msb(0x7u)) != 0x7u) return 7;
     /* Negative control: 0x800000 overflows 23-bit mantissa and MUST be rejected */
-    if ((0x800000u & ~0x7FFFFFu) == 0) return 5;
+    if ((0x800000u & ~0x7FFFFFu) == 0) return 8;
     return 0;
 }
 """
@@ -165,7 +202,7 @@ with tempfile.TemporaryDirectory() as d:
     src.write_text(MODEL_C)
     subprocess.run([cc, "-O2", "-Wall", "-Werror", "-o", str(exe), str(src)], check=True)
     res = subprocess.run([str(exe)])
-    arm("exhaustive bit-exact proof over all 8,388,608 u23 integers passes", res.returncode == 0, f"rc={res.returncode}")
+    arm("exhaustive bit-exact proof over all u23, Q6_K biased, and s23 integers passes", res.returncode == 0, f"rc={res.returncode}")
 
 print("FAILED" if fails else "PASS")
 sys.exit(1 if fails else 0)

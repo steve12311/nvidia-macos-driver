@@ -1055,7 +1055,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
  #define _OPT(pass_macro, ...) ({                         \
     bool this_progress = false;                           \
     pass_macro(this_progress, ##__VA_ARGS__);             \
-@@ -154,6 +157,165 @@
+@@ -154,6 +157,306 @@
     return 1;
  }
  
@@ -1114,6 +1114,17 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
 +   case nir_op_u2u16:
 +   case nir_op_u2u8:
 +      return nak_cg_possible_bits32(a->src[0].src.ssa, a->src[0].swizzle[comp], depth - 1) & type_mask;
++   case nir_op_i2i32:
++   case nir_op_i2i16:
++   case nir_op_i2i8: {
++      const unsigned src_bs = nir_src_bit_size(a->src[0].src);
++      const uint32_t m = nak_cg_possible_bits32(a->src[0].src.ssa, a->src[0].swizzle[comp], depth - 1);
++      if (src_bs < def->bit_size && src_bs < 32 && (m & (1u << (src_bs - 1))) == 0)
++         return m & type_mask;
++      if (src_bs >= def->bit_size)
++         return m & type_mask;
++      return type_mask;
++   }
 +   case nir_op_iand:
 +      return (nak_cg_possible_bits32(a->src[0].src.ssa, a->src[0].swizzle[comp], depth - 1) &
 +              nak_cg_possible_bits32(a->src[1].src.ssa, a->src[1].swizzle[comp], depth - 1)) & type_mask;
@@ -1144,6 +1155,20 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
 +            return ((1u << w) - 1u) & type_mask;
 +      }
 +      return type_mask;
++   case nir_op_ibfe:
++      if (nir_src_is_const(a->src[1].src) && nir_src_is_const(a->src[2].src)) {
++         const uint64_t off = nir_src_comp_as_uint(a->src[1].src, a->src[1].swizzle[comp]);
++         const uint64_t w = nir_src_comp_as_uint(a->src[2].src, a->src[2].swizzle[comp]);
++         if (w == 0)
++            return 0u;
++         if (off == 0 && w < 32) {
++            const uint32_t m = nak_cg_possible_bits32(a->src[0].src.ssa, a->src[0].swizzle[comp], depth - 1);
++            const uint32_t wmask = (1u << w) - 1u;
++            if ((m & (1u << (w - 1))) == 0)
++               return (m & wmask) & type_mask;
++         }
++      }
++      return type_mask;
 +   case nir_op_umin: {
 +      const uint32_t m0 = nak_cg_possible_bits32(a->src[0].src.ssa, a->src[0].swizzle[comp], depth - 1);
 +      const uint32_t m1 = nak_cg_possible_bits32(a->src[1].src.ssa, a->src[1].swizzle[comp], depth - 1);
@@ -1168,6 +1193,98 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
 +   return true;
 +}
 +
++/* True if def[comp] is proven to be a signed 32-bit integer in [-2^22, 2^22 - 1]. */
++static bool
++nak_cg_known_s23(nir_def *def, unsigned comp, unsigned depth)
++{
++   if (def->bit_size == 8 || def->bit_size == 16)
++      return true;
++   if (def->bit_size != 32 || depth == 0 || comp >= def->num_components)
++      return false;
++   if ((nak_cg_possible_bits32(def, comp, depth) & ~0x3FFFFFu) == 0)
++      return true;
++   nir_instr *instr = nir_def_instr(def);
++   if (instr->type == nir_instr_type_load_const) {
++      const int64_t v = nir_const_value_as_int(nir_instr_as_load_const(instr)->value[comp], 32);
++      return v >= -4194304 && v <= 4194303;
++   }
++   if (instr->type != nir_instr_type_alu)
++      return false;
++   nir_alu_instr *a = nir_instr_as_alu(instr);
++   switch (a->op) {
++   case nir_op_mov:
++      return nak_cg_known_s23(a->src[0].src.ssa, a->src[0].swizzle[comp], depth - 1);
++   case nir_op_vec2:
++   case nir_op_vec3:
++   case nir_op_vec4:
++      return nak_cg_known_s23(a->src[comp].src.ssa, a->src[comp].swizzle[0], depth - 1);
++   case nir_op_i2i32: {
++      const unsigned sbs = nir_src_bit_size(a->src[0].src);
++      return sbs == 8 || sbs == 16;
++   }
++   case nir_op_ishr:
++      if (nir_src_is_const(a->src[1].src)) {
++         const uint64_t sh = nir_src_comp_as_uint(a->src[1].src, a->src[1].swizzle[comp]);
++         return sh >= 9 && sh < 32;
++      }
++      return false;
++   case nir_op_ibfe:
++      if (nir_src_is_const(a->src[2].src)) {
++         const uint64_t w = nir_src_comp_as_uint(a->src[2].src, a->src[2].swizzle[comp]);
++         return w <= 23;
++      }
++      return false;
++   case nir_op_bcsel:
++      return nak_cg_known_s23(a->src[1].src.ssa, a->src[1].swizzle[comp], depth - 1) &&
++             nak_cg_known_s23(a->src[2].src.ssa, a->src[2].swizzle[comp], depth - 1);
++   default:
++      return false;
++   }
++}
++
++static bool
++nak_cg_alu_src_known_s23(const nir_alu_instr *alu, unsigned src_idx)
++{
++   nir_def *ssa = alu->src[src_idx].src.ssa;
++   for (unsigned i = 0; i < alu->def.num_components; i++) {
++      if (!nak_cg_known_s23(ssa, alu->src[src_idx].swizzle[i], 6))
++         return false;
++   }
++   return true;
++}
++
++/* Match i2f32(iadd(q, bias)) where q is proven in [0, 2^23 - 1] and bias in [-2^22, 2^22 - 1]
++ * (e.g. Q6_K: float(q - 32) = bitcast_float(0x4B000000 | q) - 8388640.0). */
++static bool
++nak_cg_match_biased_u23(const nir_alu_instr *alu, nir_def **q_out, unsigned *q_comp_out, int32_t *bias_out)
++{
++   if (alu->op != nir_op_i2f32 || alu->def.num_components != 1 || nir_src_bit_size(alu->src[0].src) != 32)
++      return false;
++   nir_instr *si = nir_def_instr(alu->src[0].src.ssa);
++   if (si->type != nir_instr_type_alu)
++      return false;
++   nir_alu_instr *add = nir_instr_as_alu(si);
++   if (add->op != nir_op_iadd)
++      return false;
++   const unsigned c = alu->src[0].swizzle[0];
++   for (unsigned k = 0; k < 2; k++) {
++      if (!nir_src_is_const(add->src[1 - k].src))
++         continue;
++      const int64_t bias = nir_src_comp_as_int(add->src[1 - k].src, add->src[1 - k].swizzle[c]);
++      if (bias < -4194304 || bias > 4194303)
++         continue;
++      nir_def *q = add->src[k].src.ssa;
++      const unsigned qc = add->src[k].swizzle[c];
++      if ((nak_cg_possible_bits32(q, qc, 6) & ~0x7FFFFFu) == 0) {
++         *q_out = q;
++         *q_comp_out = qc;
++         *bias_out = (int32_t)bias;
++         return true;
++      }
++   }
++   return false;
++}
++
 +static bool
 +nak_cg_u2f_magic_instr(nir_builder *b, nir_instr *instr, UNUSED void *data)
 +{
@@ -1179,30 +1296,54 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
 +   const unsigned bs = nir_src_bit_size(alu->src[0].src);
 +   const bool narrow_u = (alu->op == nir_op_u2f32) && (bs == 8 || bs == 16);
 +   const bool range_u23 = (bs == 32) && nak_cg_alu_src_known_u23(alu, 0);
-+   if (!narrow_u && !range_u23)
-+      return false;
-+   b->cursor = nir_before_instr(instr);
-+   nir_instr *upi = nir_def_instr(alu->src[0].src.ssa);
-+   nir_alu_instr *up = upi->type == nir_instr_type_alu ? nir_instr_as_alu(upi) : NULL;
-+   nir_def *f;
-+   if (narrow_u && bs == 8 && up && up->op == nir_op_unpack_32_4x8) {
-+      /* one PRMT per byte: result bytes = { word.byte[c], 0x00, 0x00, 0x4B } */
-+      nir_def *word = nir_ssa_for_alu_src(b, up, 0);
-+      nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-+      for (unsigned i = 0; i < alu->def.num_components; i++) {
-+         nir_def *bits = nir_prmt_nv(b, nir_imm_int(b, 0x7650 | alu->src[0].swizzle[i]), word,
-+                                     nir_imm_int(b, 0x4B000000));
-+         comps[i] = nir_fadd_imm(b, bits, -8388608.0);
++   if (narrow_u || range_u23) {
++      b->cursor = nir_before_instr(instr);
++      nir_instr *upi = nir_def_instr(alu->src[0].src.ssa);
++      nir_alu_instr *up = upi->type == nir_instr_type_alu ? nir_instr_as_alu(upi) : NULL;
++      nir_def *f;
++      if (narrow_u && bs == 8 && up && up->op == nir_op_unpack_32_4x8) {
++         /* one PRMT per byte: result bytes = { word.byte[c], 0x00, 0x00, 0x4B } */
++         nir_def *word = nir_ssa_for_alu_src(b, up, 0);
++         nir_def *comps[NIR_MAX_VEC_COMPONENTS];
++         for (unsigned i = 0; i < alu->def.num_components; i++) {
++            nir_def *bits = nir_prmt_nv(b, nir_imm_int(b, 0x7650 | alu->src[0].swizzle[i]), word,
++                                        nir_imm_int(b, 0x4B000000));
++            comps[i] = nir_fadd_imm(b, bits, -8388608.0);
++         }
++         f = nir_vec(b, comps, alu->def.num_components);
++      } else {
++         nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
++         if (bs != 32)
++            x = nir_u2u32(b, x);
++         f = nir_fadd_imm(b, nir_ior_imm(b, x, 0x4B000000), -8388608.0);
 +      }
-+      f = nir_vec(b, comps, alu->def.num_components);
-+   } else {
-+      nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
-+      if (bs != 32)
-+         x = nir_u2u32(b, x);
-+      f = nir_fadd_imm(b, nir_ior_imm(b, x, 0x4B000000), -8388608.0);
++      nir_def_replace(&alu->def, f);
++      return true;
 +   }
-+   nir_def_replace(&alu->def, f);
-+   return true;
++   if (alu->op == nir_op_i2f32) {
++      nir_def *q = NULL;
++      unsigned qc = 0;
++      int32_t bias = 0;
++      if (nak_cg_match_biased_u23(alu, &q, &qc, &bias)) {
++         b->cursor = nir_before_instr(instr);
++         nir_def *qs = nir_channel(b, q, qc);
++         nir_def *f = nir_fadd_imm(b, nir_ior_imm(b, qs, 0x4B000000), (double)bias - 8388608.0);
++         nir_def_replace(&alu->def, f);
++         return true;
++      }
++      const bool narrow_s = (bs == 8 || bs == 16);
++      const bool range_s23 = (bs == 32) && nak_cg_alu_src_known_s23(alu, 0);
++      if (narrow_s || range_s23) {
++         b->cursor = nir_before_instr(instr);
++         nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
++         if (bs != 32)
++            x = nir_i2i32(b, x);
++         nir_def *f = nir_fadd_imm(b, nir_iadd_imm(b, x, 0x4B400000), -12582912.0);
++         nir_def_replace(&alu->def, f);
++         return true;
++      }
++   }
++   return false;
 +}
 +
 +static bool
@@ -1221,7 +1362,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
  void
  nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
  {
-@@ -209,6 +371,17 @@
+@@ -209,6 +512,17 @@
        };
        LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
                                &peephole_select_options);
@@ -1239,7 +1380,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
        LOOP_OPT(nir, nir_opt_intrinsics);
        LOOP_OPT(nir, nir_opt_idiv_const, 32);
        LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_algebraic);
-@@ -369,6 +542,231 @@
+@@ -369,6 +683,231 @@
     }
  }
  
@@ -1471,7 +1612,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
  void
  nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak)
  {
-@@ -403,6 +801,16 @@
+@@ -403,6 +942,16 @@
     OPT(nir, nir_split_var_copies);
     OPT(nir, nir_split_struct_vars, nir_var_function_temp);
  
@@ -1488,7 +1629,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     nak_optimize_nir(nir, nak);
  
     OPT(nir, nir_opt_barrier_modes);
-@@ -801,6 +1209,19 @@
+@@ -801,6 +1350,19 @@
     b->cursor = nir_before_instr(&intrin->instr);
  
     const nir_io_semantics sem = nir_intrinsic_io_semantics(intrin);
@@ -1508,7 +1649,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     uint16_t addr = nak_fs_out_addr(sem.location, sem.dual_source_blend_index) +
                     nir_src_as_uint(intrin->src[1]) * 16 +
                     nir_intrinsic_component(intrin) * 4;
-@@ -1630,6 +2051,798 @@
+@@ -1630,6 +2192,798 @@
     }
  }
  
@@ -2307,7 +2448,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
  void
  nak_postprocess_nir(nir_shader *nir,
                      const struct nak_compiler *nak,
-@@ -1646,6 +2859,33 @@
+@@ -1646,6 +3000,33 @@
  
     nak_optimize_nir(nir, nak);
  
@@ -2341,7 +2482,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     const nir_lower_subgroups_options subgroups_options = {
        .subgroup_size = NAK_SUBGROUP_SIZE,
        .ballot_bit_size = 32,
-@@ -1673,6 +2913,21 @@
+@@ -1673,6 +3054,21 @@
        OPT(nir, nak_nir_lower_kepler_shared_atomics);
     }
  
@@ -2363,7 +2504,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     if (nir_shader_has_local_variables(nir)) {
        OPT(nir, nir_lower_vars_to_explicit_types, nir_var_function_temp,
            glsl_get_natural_size_align_bytes);
-@@ -1693,6 +2948,13 @@
+@@ -1693,6 +3089,13 @@
     vectorize_opts.robust_modes = robust2_modes;
     OPT(nir, nir_opt_load_store_vectorize, &vectorize_opts);
  
@@ -2377,7 +2518,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     nir_lower_mem_access_bit_sizes_options mem_bit_size_options = {
        .modes = nir_var_mem_constant | nir_var_mem_ubo | nir_var_mem_generic |
                 nir_var_mem_task_payload,
-@@ -1817,8 +3079,18 @@
+@@ -1817,8 +3220,18 @@
        OPT(nir, nir_normalize_sin_cos);
  
     OPT(nir, nir_opt_fp_math_ctrl);
@@ -2396,7 +2537,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     do {
        progress = false;
        OPT(nir, nir_opt_algebraic_late);
-@@ -1850,6 +3122,10 @@
+@@ -1850,6 +3263,10 @@
        OPT(nir, nir_split_conversions, &split_conv_opts);
     }
  
@@ -2407,7 +2548,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
     /* Re-materialize load_const instructions in the blocks that use them.
      * This is both a register pressure optimization and a ensures correctness
      * in the presence of all of the control flow modifications we're about to
-@@ -1868,6 +3144,17 @@
+@@ -1868,6 +3285,17 @@
           OPT(nir, nir_opt_dce);
        }
     }

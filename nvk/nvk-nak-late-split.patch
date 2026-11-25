@@ -1,6 +1,6 @@
 --- a/src/nouveau/compiler/nak_nir.c	2026-11-23 19:27:11
 +++ b/src/nouveau/compiler/nak_nir.c	2026-11-23 19:36:07
-@@ -2841,8 +2841,43 @@
+@@ -2982,8 +2982,43 @@
        progress |= nir_progress(np > 0, impl, nir_metadata_none);
     }
     return progress;
@@ -44,7 +44,7 @@
  void
  nak_postprocess_nir(nir_shader *nir,
                      const struct nak_compiler *nak,
-@@ -3051,6 +3086,19 @@
+@@ -3192,6 +3227,19 @@
     default:
        UNREACHABLE("Unsupported shader stage");
     }
@@ -64,7 +64,7 @@
  
     if (OPT(nir, nak_nir_lower_load_store, nak))
        OPT(nir, nir_opt_constant_folding);
-@@ -3135,6 +3183,12 @@
+@@ -3276,6 +3324,12 @@
     if (OPT(nir, nak_nir_rematerialize_load_const))
        OPT(nir, nir_opt_dce);
  
