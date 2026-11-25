@@ -2251,7 +2251,7 @@ diff -ruN a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
  
 +   /* Small per-thread arrays (up to 16 elements by default, NAK_B83_ARRAYS=8|16|32 to change, NVMTL_NO_SMALL_ARRAYS
 +    * to turn off) are lowered to if-else trees so they live in registers rather than local memory. */
-+   if (nak->sm == 120 && nir->info.stage == MESA_SHADER_COMPUTE) {
++   if ((nak->sm == 86 || nak->sm == 89 || nak->sm == 120) && nir->info.stage == MESA_SHADER_COMPUTE) {
 +      const unsigned limit = nvmtl_small_array_limit(getenv("NAK_B83_ARRAYS"));
 +      if (limit) {
 +         const bool lowered = OPT(nir, nir_lower_indirect_derefs_to_if_else_trees,   /* 26.3 name */
