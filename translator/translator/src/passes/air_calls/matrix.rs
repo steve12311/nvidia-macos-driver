@@ -931,6 +931,21 @@ pub(in crate::passes) fn plan_mat8_fusion(
         c: Word,
         sig: Matrix8Intrinsic,
     }
+    let uses_psb = ctx.module.memory_model.as_ref().is_some_and(|mm| {
+        mm.operands.first()
+            == Some(&Operand::AddressingModel(
+                spirv::AddressingModel::PhysicalStorageBuffer64,
+            ))
+    }) || ctx.module.capabilities.iter().any(|cap| {
+        matches!(
+            cap.operands.first(),
+            Some(Operand::Capability(
+                spirv::Capability::PhysicalStorageBufferAddresses
+                    | spirv::Capability::VariablePointers
+                    | spirv::Capability::VariablePointersStorageBuffer
+            ))
+        )
+    });
     let blocks = &ctx.module.functions[entry_idx].blocks;
     let cm_env = mat8_cm_env(&ctx.module, &ctx.new_globals, blocks);
     let mut uses: HashMap<Word, usize> = HashMap::default();
@@ -1088,6 +1103,13 @@ pub(in crate::passes) fn plan_mat8_fusion(
                 break;
             }
             if group.len() == 1 && u.1.is_none() {
+                continue;
+            }
+            // Under PhysicalStorageBuffer64, single-row k-fusion (`rows=1, ks=2`) builds a
+            // half-empty 16x16 A / 16x8 C `m16n8k16` tuple whose 4-register alignment alongside
+            // live 64-bit device pointers triggers a register-allocation miscompilation in NAK
+            // (confirmed: `NAK_DEBUG=spill` and unfused `m16n8k8` both produce exact results).
+            if uses_psb && group.len() == 1 && u.1.is_some() {
                 continue;
             }
             let mut fuse = Mat8Fuse {

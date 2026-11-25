@@ -2222,6 +2222,73 @@ declare void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float>, ptr addr
 }
 
 #[test]
+fn native_simdgroup_matrix_bda_skips_half_empty_k_fusion() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @k(ptr addrspace(1) %a_src, ptr addrspace(1) %a_pad, ptr addrspace(1) %b_src, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %cond = icmp ult i32 %tid, 16
+  br i1 %cond, label %use_src, label %use_pad
+
+use_src:
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %a_src, i64 16
+  br label %merge
+
+use_pad:
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %a_pad, i64 32
+  br label %merge
+
+merge:
+  %ap0 = phi ptr addrspace(1) [ %p0, %use_src ], [ %p1, %use_pad ]
+  %ap1 = getelementptr inbounds i8, ptr addrspace(1) %ap0, i64 16
+  %bp1 = getelementptr inbounds i8, ptr addrspace(1) %b_src, i64 128
+  %a0 = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %ap0, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %a1 = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %ap1, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %b0 = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %b_src, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %b1 = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %bp1, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %m0 = tail call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32(<64 x half> %a0, <64 x half> %b0, <64 x float> zeroinitializer)
+  %m1 = tail call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32(<64 x half> %a1, <64 x half> %b1, <64 x float> %m0)
+  call void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float> %m1, ptr addrspace(1) %dst, i64 8, <2 x i64> zeroinitializer, i1 false)
+  ret void
+}
+
+declare <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1), i64, <2 x i64>, i1)
+declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32(<64 x half>, <64 x half>, <64 x float>)
+declare void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float>, ptr addrspace(1), i64, <2 x i64>, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"a_src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"a_pad"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"b_src"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!7 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        Default::default(),
+    )
+    .expect("translate BDA matrix k-chain");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    let muladds = asm
+        .lines()
+        .filter(|line| line.contains("OpCooperativeMatrixMulAddKHR"))
+        .count();
+    assert_eq!(
+        muladds, 2,
+        "BDA single-row k-chain must stay unfused (2x m16n8k8) instead of half-empty m16n8k16:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_kernel_threadgroup_param_direct_scalar_load_uses_element_zero() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
