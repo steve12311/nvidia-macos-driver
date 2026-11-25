@@ -1268,6 +1268,13 @@ fn inline_one_call(
                     ni.result_id = inst.result_id.and_then(|r| remap.get(&r).copied());
                     ni.result_type = inst.result_type;
                     ni.operands = inst.operands.iter().map(|o| map_op(o, &remap)).collect();
+                    spliced.extend(retarget_inlined_memory_access(
+                        ctx,
+                        inst,
+                        &mut ni,
+                        &result_types,
+                        pointer_types,
+                    ));
                     retarget_inlined_pointer_result(ctx, &mut ni, &result_types, pointer_types);
                     record_result_type(&mut result_types, &ni);
                     spliced.push(ni);
@@ -1507,6 +1514,13 @@ fn inline_multiblock(
                         .iter()
                         .map(|o| mapped_operand(o, remap))
                         .collect();
+                    insts.extend(retarget_inlined_memory_access(
+                        ctx,
+                        inst,
+                        &mut ni,
+                        result_types,
+                        pointer_types,
+                    ));
                     retarget_inlined_pointer_result(ctx, &mut ni, result_types, pointer_types);
                     record_result_type(result_types, &ni);
                     insts.push(ni);
@@ -1982,6 +1996,70 @@ fn pointer_type_info(
         })?;
     pointer_types.insert(ty, info);
     Some(info)
+}
+
+fn retarget_inlined_memory_access(
+    ctx: &mut Ctx,
+    original: &Instruction,
+    mapped: &mut Instruction,
+    result_types: &HashMap<Word, Word>,
+    pointer_types: &mut HashMap<Word, (StorageClass, Word)>,
+) -> Option<Instruction> {
+    let value_type = match original.class.opcode {
+        Op::Load => original.result_type?,
+        Op::Store => {
+            let Operand::IdRef(value) = original.operands.get(1)? else {
+                return None;
+            };
+            *result_types.get(value)?
+        }
+        _ => return None,
+    };
+    let (Some(Operand::IdRef(formal)), Some(Operand::IdRef(actual))) =
+        (original.operands.first(), mapped.operands.first())
+    else {
+        return None;
+    };
+    let actual = *actual;
+    if *formal == actual {
+        return None;
+    }
+    let (_, formal_pointee) = pointer_type_info(ctx, pointer_types, *result_types.get(formal)?)?;
+    let (storage, mut pointee) = pointer_type_info(ctx, pointer_types, *result_types.get(&actual)?)?;
+    if formal_pointee != value_type || pointee == value_type || storage != StorageClass::Function {
+        return None;
+    }
+
+    let mut dimensions = 0;
+    while pointee != value_type {
+        let aggregate = ctx
+            .module
+            .types_global_values
+            .iter()
+            .chain(&ctx.new_globals)
+            .find(|inst| {
+                inst.result_id == Some(pointee)
+                    && matches!(inst.class.opcode, Op::TypeArray | Op::TypeStruct)
+            })?;
+        let Operand::IdRef(element) = aggregate.operands.first()? else {
+            return None;
+        };
+        pointee = *element;
+        dimensions += 1;
+    }
+
+    let pointer_type = ctx.ty_ptr(storage, value_type);
+    let pointer = ctx.module.fresh_id();
+    let zero = ctx.const_uint(0);
+    let mut operands = vec![Operand::IdRef(actual)];
+    operands.extend(std::iter::repeat_n(Operand::IdRef(zero), dimensions));
+    mapped.operands[0] = Operand::IdRef(pointer);
+    Some(Instruction::new(
+        Op::InBoundsAccessChain,
+        Some(pointer_type),
+        Some(pointer),
+        operands,
+    ))
 }
 
 fn retarget_inlined_pointer_result(

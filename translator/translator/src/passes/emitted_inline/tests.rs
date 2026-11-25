@@ -268,8 +268,10 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
     let ptr_function_wrapper = 110;
     let uint_1 = 111;
     let helper_param = 25;
+    let direct_param = 26;
     let local_struct = 30;
     let access_result = 31;
+    let loaded_value = 32;
 
     let mut entry = mkfunc(
         10,
@@ -286,7 +288,11 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
                 Op::FunctionCall,
                 None,
                 None,
-                vec![Operand::IdRef(20), Operand::IdRef(local_struct)],
+                vec![
+                    Operand::IdRef(20),
+                    Operand::IdRef(local_struct),
+                    Operand::IdRef(local_struct),
+                ],
             ),
             Instruction::new(Op::Return, None, None, vec![]),
         ],
@@ -304,6 +310,18 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
                 Some(access_result),
                 vec![Operand::IdRef(helper_param), Operand::IdRef(uint_0)],
             ),
+            Instruction::new(
+                Op::Load,
+                Some(v4float),
+                Some(loaded_value),
+                vec![Operand::IdRef(direct_param)],
+            ),
+            Instruction::new(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(direct_param), Operand::IdRef(loaded_value)],
+            ),
             Instruction::new(Op::Return, None, None, vec![]),
         ],
     );
@@ -311,6 +329,12 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
         Op::FunctionParameter,
         Some(ptr_private_struct),
         Some(helper_param),
+        vec![],
+    ));
+    helper.parameters.push(Instruction::new(
+        Op::FunctionParameter,
+        Some(ptr_private_v4float),
+        Some(direct_param),
         vec![],
     ));
 
@@ -346,9 +370,9 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
             vec![Operand::LiteralBit32(1)],
         ),
         type_inst(
-            Op::TypeArray,
+            Op::TypeStruct,
             wrapper_array,
-            vec![Operand::IdRef(vertex_struct), Operand::IdRef(uint_1)],
+            vec![Operand::IdRef(vertex_struct)],
         ),
         type_inst(
             Op::TypePointer,
@@ -420,6 +444,20 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
         Some(StorageClass::Function),
         "access-chain result storage must follow the remapped base pointer"
     );
+    let instructions = &ctx.module.functions[0].blocks[0].instructions;
+    for opcode in [Op::Load, Op::Store] {
+        let memory_inst = instructions
+            .iter()
+            .find(|i| i.class.opcode == opcode)
+            .expect("inlined memory access");
+        let pointer = instructions
+            .iter()
+            .find(|i| i.result_id.map(Operand::IdRef).as_ref() == memory_inst.operands.first())
+            .expect("memory access pointer");
+        assert_eq!(pointer.class.opcode, Op::InBoundsAccessChain);
+        assert_eq!(pointer.operands, access.operands);
+        assert_eq!(pointer.result_type, access.result_type);
+    }
 }
 
 #[test]
