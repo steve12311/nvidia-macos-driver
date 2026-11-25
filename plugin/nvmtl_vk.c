@@ -4534,7 +4534,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     // what changed is the table. On the same table page that is a new dynamic offset, not a new set.
     const int was = sametb && t->last[which] && t->dirty[which] && t->last_idx[which] < c->nsets
                     && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
-    if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & 0xffffffffull)
+    if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & t->chg[which][0] & 0xffffffffull)
         && !(t->chg[which][0] >> 32) && !t->chg[which][1] && !t->chg[which][2] && !t->chg[which][3]) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
@@ -4587,7 +4587,7 @@ int nvmtl_vk_bind_buffer(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_buffer
     int r = nvmtl_bind_slot(c, set, index, NVMTL_SLOT_BUF, b->buf, offset);
     nvmtl_hz_pend_clear(c);
     if (!r) { nvmtl_bindtable *t = (nvmtl_bindtable *)c->table; nvmtl_slot *sl = &t->s[set][index]; uint64_t a = nvmtl_vk_buffer_address(b);
-              if (sl->size != b->size || sl->address != a) t->dirty[set] = 1;
+              if (sl->size != b->size || sl->address != a) { t->dirty[set] = 1; t->chg[set][0] |= 1ull << index; }
               sl->size = b->size; sl->address = a; }
     return r;
 }
@@ -6193,9 +6193,11 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     cs = data.bytes; n = data.length;
     if (nvmtl_vk_init()) return -1;
     if (ensure_descriptors()) return -1;
-    if (!g_heapSet && nvmtl_spirv_uses_set(cs, n / 4, 2)) {
+    const int uses_heap = nvmtl_spirv_uses_set(cs, n / 4, 2);
+    if (!g_heapSet && uses_heap) {
         nvlog("vk: compute pipeline REFUSED - the kernel indexes the bindless heap (set 2) and this device has none"); return -1; }
     memset(out, 0, sizeof *out);
+    out->uses_heap = (uint8_t)uses_heap;
     if (!nvmtl_spirv_ok(cs, n, "compute module")) return -1;
     out->stex_hi[0] = nvmtl_spirv_stex_hi(cs, n);
     nvmtl_spirv_texel_mask(cs, n, out->tbm[0]); memset(out->tbm[1], 0, sizeof out->tbm[1]);
@@ -7142,8 +7144,8 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
     uint32_t tg[3], groups[3];
     for (int d = 0; d < 3; d++) { if (!tgIn[d] || !threads[d]) return; tg[d] = tgIn[d]; groups[d] = (threads[d] + tg[d] - 1) / tg[d]; }
     if (!(p = nvmtl_align_guard_pick(c, p))) { c->skipped++; return; }
-    VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p), nvmtl_snapshot_set_c(c, 1, p), g_heapSet };
-    if (!s[0] || !s[1]) { c->nobind = 1; return; }
+    VkDescriptorSet s0 = nvmtl_snapshot_set_c(c, 0, p);
+    if (!s0) { c->nobind = 1; return; }
     c->nobind = 0;
     int bound = 0;
     for (uint32_t mask = 0; mask < 8; mask++) {
@@ -7160,7 +7162,12 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
         VkPipeline vp = nvmtl_compute_variant(p, local);
         if (!vp) { c->skipped++; continue; }
         pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-        if (!bound) { pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out); bound = 1; }
+        if (!bound) {
+            pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, 1, &s0, nvmtl_table_ubo() ? 1 : 0, &c->dyn_out[0]);
+            if (g_heapSet && p->uses_heap)
+                pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 2, 1, &g_heapSet, 0, NULL);
+            bound = 1;
+        }
         // Metal allows any group count per axis; Vulkan caps it (NVK: 0x7fffffff x 65535 x 65535, the width of the QMD
         // grid fields). Geekbench's OpenCL Face Detection dispatched past 65535 on y and NAK's nak_fill_qmd aborted the
         // process. Split into chunks and advance thread_base/threadgroup_base, which the translated kernel adds to
@@ -7251,12 +7258,14 @@ void nvmtl_vk_cmd_dispatch_indirect_tg(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffe
     if (!(p = nvmtl_align_guard_pick(c, p))) { c->skipped++; return; }
     VkPipeline vp = nvmtl_compute_variant(p, tg);
     if (!vp) { c->skipped++; return; }
-    VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p), nvmtl_snapshot_set_c(c, 1, p), g_heapSet };
-    if (!s[0] || !s[1]) { c->nobind = 1; return; }
+    VkDescriptorSet s0 = nvmtl_snapshot_set_c(c, 0, p);
+    if (!s0) { c->nobind = 1; return; }
     c->nobind = 0;
     (void)g;   // the grid is the GPU's to write: never read at record time (it was stale or 0, Eevee's light culling)
     pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, c->dyn_out);
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, 1, &s0, nvmtl_table_ubo() ? 1 : 0, &c->dyn_out[0]);
+    if (g_heapSet && p->uses_heap)
+        pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 2, 1, &g_heapSet, 0, NULL);
     // 0x80000000 | threadgroup size: the shader takes threads_per_grid and threadgroups_per_grid from NumWorkgroups
     // (translator stage_input/kernel_grid.rs), the grid the GPU actually dispatched
     const uint32_t F = 0x80000000u;

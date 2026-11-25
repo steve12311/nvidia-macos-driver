@@ -6526,8 +6526,17 @@ static void nvmtl_stride_dropped(NSUInteger st) { static BOOL said; if (!said &&
     if ((_samplers.count || _tgLen.count) && _e78VarSel && _e78VarFor == _ps && nvmtl_enc78_on(NVMTL_E78_H5)) {
         selected = _e78VarSel; nvmtl_enc78_count(E78C_VARHIT, 1);
     } else if (_samplers.count || _tgLen.count) {
-        if (!_e78Key || !nvmtl_enc78_on(NVMTL_E78_H5))
-            _e78Key = [NSJSONSerialization dataWithJSONObject:@{@"s": _samplers ?: @{}, @"tg": _tgLen ?: @{}} options:NSJSONWritingSortedKeys error:NULL];
+        if (!_e78Key || !nvmtl_enc78_on(NVMTL_E78_H5)) {
+            if (!_samplers.count && _tgLen.count == 1 && _tgLenMask != 0 && (_tgLenMask & (_tgLenMask - 1u)) == 0) {
+                const unsigned idx = (unsigned)__builtin_ctz(_tgLenMask);
+                char jbuf[64];
+                int jlen = snprintf(jbuf, sizeof jbuf, "{\"s\":{},\"tg\":{\"%u\":%u}}", idx, _tgLenVal[idx]);
+                if (jlen > 0 && (size_t)jlen < sizeof jbuf)
+                    _e78Key = [NSData dataWithBytes:jbuf length:(size_t)jlen];
+            }
+            if (!_e78Key)
+                _e78Key = [NSJSONSerialization dataWithJSONObject:@{@"s": _samplers ?: @{}, @"tg": _tgLen ?: @{}} options:NSJSONWritingSortedKeys error:NULL];
+        }
         NSData *key = _e78Key;
         nvmtl_enc78_count(E78C_VARMISS, 1);
         @synchronized (_ps) {
@@ -6867,12 +6876,37 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     if (!logged++) nvlog("compute setImageblockWidth:%lu height:%lu (imageblock lives in thread-private memory)",
                          (unsigned long)w, (unsigned long)h);
 }
+static NSString *nvmtl_tg_idx_key(NSUInteger i) {
+    static NSString *kKeys[32];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (NSUInteger k = 0; k < 32; k++) kKeys[k] = [NSString stringWithFormat:@"%lu", (unsigned long)k];
+    });
+    return i < 32 ? kKeys[i] : @(i).stringValue;
+}
 - (void)setThreadgroupMemoryLength:(NSUInteger)len atIndex:(NSUInteger)i {
-    if (!_tgLen) _tgLen = [NSMutableDictionary new];
     if (nvmtl_zprobe_on()) nvlog("ZENC tgMemory   idx %-3lu length %lu", (unsigned long)i, (unsigned long)len);
-    NSUInteger was = [_tgLen[@(i).stringValue] unsignedIntegerValue];
-    if (len) _tgLen[@(i).stringValue] = @(len);
-    else     [_tgLen removeObjectForKey:@(i).stringValue];
+    if (i < 32 && len <= UINT32_MAX) {
+        const uint32_t bit = 1u << (uint32_t)i;
+        const uint32_t cur = (_tgLenMask & bit) ? _tgLenVal[i] : 0u;
+        if (cur == (uint32_t)len) return;
+        if (len) { _tgLenVal[i] = (uint32_t)len; _tgLenMask |= bit; }
+        else     { _tgLenVal[i] = 0u; _tgLenMask &= ~bit; }
+        NSString *key = nvmtl_tg_idx_key(i);
+        if (len) {
+            if (!_tgLen) _tgLen = [NSMutableDictionary new];
+            _tgLen[key] = @(len);
+        } else {
+            [_tgLen removeObjectForKey:key];
+        }
+        _e78Key = nil; _e78VarSel = nil;
+        return;
+    }
+    if (!_tgLen) _tgLen = [NSMutableDictionary new];
+    NSString *key = nvmtl_tg_idx_key(i);
+    NSUInteger was = [_tgLen[key] unsignedIntegerValue];
+    if (len) _tgLen[key] = @(len);
+    else     [_tgLen removeObjectForKey:key];
     if (was != len) { _e78Key = nil; _e78VarSel = nil; }
 }
 // GPU-encoded dispatches (NVMTL_GPU_ICB=1). The threadgroup size a kernel recorded is only in the GPU record, and Vulkan needs it when the
@@ -7078,7 +7112,7 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     // this point, as in Apple's encoders. WAS: kept until dealloc, which MPS defers to the completion handler; by then
     // Espresso had recycled the objects they named and .cxx_destruct released freed memory (mediaanalysisd, issue #107).
     for (unsigned k = 0; k < NVMTL_NBUFAT; k++) { _baObj[k] = nil; _baN[k] = 0; }
-    _samplers = nil; _tgLen = nil; _e78Key = nil;
+    _samplers = nil; _tgLen = nil; _tgLenMask = 0; _e78Key = nil;
 }
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (NSString *)label { return _label; }

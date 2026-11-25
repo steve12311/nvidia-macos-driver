@@ -212,6 +212,8 @@ int nvmtl_gpu_icb_on(void);
 @interface NVMTLComputeCommandEncoder : NSObject <MTLComputeCommandEncoder> {
   @public NVMTLCommandBuffer *_cb; NVMTLComputePipelineState *_ps; NSMutableArray *_scratch; NSMutableDictionary *_samplers;
   NSMutableDictionary *_tgLen;
+  uint32_t _tgLenVal[32];
+  uint32_t _tgLenMask;
   // The binding table, by Metal buffer index: the buffer, its offset and, for setBytes, the inline length and base.
   // Plain arrays: WAS an NSMutableDictionary of NSArrays, three allocations on every setBuffer (a large part of the
   // ~2.5 us of host time per dispatch against Apple's ~0.3 us). _baN: 0 unbound, 2 = buffer+offset, 4 = setBytes form.
