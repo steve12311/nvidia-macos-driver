@@ -14,7 +14,7 @@ impl Emitter {
         }
         if raw.device_addr_base.is_some() {
             let ty = self.resolve_type(ty)?;
-            return self.emit_device_addr_store(&ty, value, raw, instructions);
+            return self.emit_device_addr_store(&ty, value, raw, access_align, instructions);
         }
         let resolved_ty = self.resolve_type(ty)?;
         let (store_size, _) = self.raw_type_size_align(&resolved_ty)?;

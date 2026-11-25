@@ -14732,6 +14732,114 @@ exit:
 }
 
 #[test]
+fn native_bda_subaligned_load_and_store_split_into_aligned_chunks() {
+    // Models 22-byte block_q5_0 under BDA: a 2-byte aligned i32 load and a 1-byte aligned
+    // i32 store must split into naturally aligned PhysicalStorageBuffer accesses (size_B <= align).
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %pad, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %off = mul i64 %idx, 22
+  %cond = icmp ult i32 %tid, 16
+  br i1 %cond, label %left, label %right
+
+left:
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src, i64 %off
+  %outp0 = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %off
+  br label %merge
+
+right:
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %pad, i64 %off
+  %outp1 = getelementptr inbounds i8, ptr addrspace(1) %pad, i64 %off
+  br label %merge
+
+merge:
+  %base = phi ptr addrspace(1) [ %p0, %left ], [ %p1, %right ]
+  %outp = phi ptr addrspace(1) [ %outp0, %left ], [ %outp1, %right ]
+  %d = load half, ptr addrspace(1) %base, align 2
+  %qh = getelementptr inbounds i8, ptr addrspace(1) %base, i64 2
+  %bits = load i32, ptr addrspace(1) %qh, align 2
+  store half %d, ptr addrspace(1) %outp, align 2
+  %outq = getelementptr inbounds i8, ptr addrspace(1) %outp, i64 1
+  store i32 %bits, ptr addrspace(1) %outq, align 1
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"pad"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"dst"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_subaligned_split_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp)
+        .expect("subaligned BDA load and store must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    let module = load_bytes(&spv).expect("load spv");
+    let type_bytes = |ty: Word| -> Option<u32> {
+        let def = module
+            .types_global_values
+            .iter()
+            .find(|i| i.result_id == Some(ty))?;
+        match def.class.opcode {
+            Op::TypeInt | Op::TypeFloat => match def.operands.first() {
+                Some(Operand::LiteralBit32(bits)) => Some(bits / 8),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut psb_u16_loads = 0usize;
+    let mut psb_u8_stores = 0usize;
+    for inst in module.all_inst_iter() {
+        match inst.class.opcode {
+            Op::Load => {
+                if let (Some(rty), [_, Operand::MemoryAccess(a), Operand::LiteralBit32(align)]) =
+                    (inst.result_type, inst.operands.as_slice())
+                {
+                    if a.contains(spirv::MemoryAccess::ALIGNED) {
+                        if let Some(size) = type_bytes(rty) {
+                            assert!(
+                                size <= *align,
+                                "PhysicalStorageBuffer load size {size} exceeds align {align}:\n{asm}"
+                            );
+                            if size == 2 && *align == 2 {
+                                psb_u16_loads += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Op::Store => {
+                if let [_, _, Operand::MemoryAccess(a), Operand::LiteralBit32(align)] =
+                    inst.operands.as_slice()
+                {
+                    if a.contains(spirv::MemoryAccess::ALIGNED) && *align == 1 {
+                        psb_u8_stores += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(psb_u16_loads >= 2, "expected 2 u16 aligned loads:\n{asm}");
+    assert!(psb_u8_stores >= 4, "expected 4 u8 aligned stores:\n{asm}");
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_helper_nullness_tracks_through_derived_gep_without_pointer_phis() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

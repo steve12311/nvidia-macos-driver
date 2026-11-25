@@ -14,7 +14,7 @@ impl Emitter {
         }
         if raw.device_addr_base.is_some() {
             let ty = self.resolve_type(ty)?;
-            return self.emit_device_addr_load(result, &ty, raw, instructions);
+            return self.emit_device_addr_load(result, &ty, raw, access_align, instructions);
         }
         self.emit_raw_load_at(result, ty, raw, 0, access_align, instructions)
     }
@@ -415,11 +415,26 @@ impl Emitter {
         }
     }
 
+    pub(in crate::native::emitter) fn device_addr_align_for_access(
+        &mut self,
+        ty: &LlType,
+        access_align: Option<u64>,
+    ) -> u32 {
+        let natural = self.device_addr_align(ty);
+        match access_align {
+            Some(a) if a > 0 && a.is_power_of_two() => {
+                natural.min(a.min(u32::MAX as u64) as u32)
+            }
+            _ => natural,
+        }
+    }
+
     pub(in crate::native::emitter) fn emit_device_addr_load(
         &mut self,
         result: Word,
         ty: &LlType,
         raw: &RawBufferOffset,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         self.used_device_address = true;
@@ -428,7 +443,8 @@ impl Emitter {
             .device_addr_base
             .ok_or("native emitter: device load has no base")?;
         let result_ty = self.type_id(ty)?;
-        let helper = self.null_bda_load_helper(ty)?;
+        let align = self.device_addr_align_for_access(ty, access_align);
+        let helper = self.null_bda_load_helper(ty, align)?;
         instructions.push(Self::inst(
             Op::FunctionCall,
             Some(result_ty),
@@ -442,8 +458,8 @@ impl Emitter {
         Ok(())
     }
 
-    fn null_bda_load_helper(&mut self, ty: &LlType) -> Result<Word, String> {
-        let key = (ty.clone(), self.constant_space_load);
+    fn null_bda_load_helper(&mut self, ty: &LlType, align: u32) -> Result<Word, String> {
+        let key = (ty.clone(), self.constant_space_load, align);
         if let Some(helper) = self.null_bda_load_helpers.get(&key) {
             return Ok(*helper);
         }
@@ -460,7 +476,6 @@ impl Emitter {
         let live = self.fresh();
         let merge = self.fresh();
         let valid = self.fresh();
-        let loaded = self.fresh();
         let result = self.fresh();
         let entry_instructions = vec![
             Self::inst(
@@ -490,48 +505,7 @@ impl Emitter {
             ),
         ];
         let mut instructions = Vec::new();
-        let ptr_ty = self.ptr_type_id(StorageClass::PhysicalStorageBuffer, ty)?;
-        let p = match self.nonwritable_psb_wrapper(ty)? {
-            Some(wrapper_ptr_ty) => {
-                let w = self.fresh();
-                instructions.push(Self::inst(
-                    Op::ConvertUToPtr,
-                    Some(wrapper_ptr_ty),
-                    Some(w),
-                    vec![Operand::IdRef(addr)],
-                ));
-                let zero = self.const_uint(0)?;
-                let p = self.fresh();
-                instructions.push(Self::inst(
-                    Op::AccessChain,
-                    Some(ptr_ty),
-                    Some(p),
-                    vec![Operand::IdRef(w), Operand::IdRef(zero)],
-                ));
-                p
-            }
-            None => {
-                let p = self.fresh();
-                instructions.push(Self::inst(
-                    Op::ConvertUToPtr,
-                    Some(ptr_ty),
-                    Some(p),
-                    vec![Operand::IdRef(addr)],
-                ));
-                p
-            }
-        };
-        let align = self.device_addr_align(ty);
-        instructions.push(Self::inst(
-            Op::Load,
-            Some(result_ty),
-            Some(loaded),
-            vec![
-                Operand::IdRef(p),
-                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
-                Operand::LiteralBit32(align),
-            ],
-        ));
+        let loaded = self.emit_psb_load_value(ty, addr, align, &mut instructions)?;
         instructions.push(Self::inst(
             Op::Branch,
             None,
@@ -659,15 +633,184 @@ impl Emitter {
         Ok(Some(wrapper_ptr))
     }
 
-    pub(in crate::native::emitter) fn emit_device_addr_store(
+    fn emit_psb_addr_offset(
+        &mut self,
+        addr: Word,
+        byte_offset: u64,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        if byte_offset == 0 {
+            return Ok(addr);
+        }
+        let i64_ty = self.type_id(&LlType::Int(64))?;
+        let off = self.const_signed_int(64, byte_offset as i64)?;
+        let out = self.fresh();
+        instructions.push(Self::inst(
+            Op::IAdd,
+            Some(i64_ty),
+            Some(out),
+            vec![Operand::IdRef(addr), Operand::IdRef(off)],
+        ));
+        Ok(out)
+    }
+
+    fn emit_psb_aligned_load(
+        &mut self,
+        ty: &LlType,
+        addr: Word,
+        align: u32,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let result_ty = self.type_id(ty)?;
+        let ptr_ty = self.ptr_type_id(StorageClass::PhysicalStorageBuffer, ty)?;
+        let p = match self.nonwritable_psb_wrapper(ty)? {
+            Some(wrapper_ptr_ty) => {
+                let w = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ConvertUToPtr,
+                    Some(wrapper_ptr_ty),
+                    Some(w),
+                    vec![Operand::IdRef(addr)],
+                ));
+                let zero = self.const_uint(0)?;
+                let p = self.fresh();
+                instructions.push(Self::inst(
+                    Op::AccessChain,
+                    Some(ptr_ty),
+                    Some(p),
+                    vec![Operand::IdRef(w), Operand::IdRef(zero)],
+                ));
+                p
+            }
+            None => {
+                let p = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ConvertUToPtr,
+                    Some(ptr_ty),
+                    Some(p),
+                    vec![Operand::IdRef(addr)],
+                ));
+                p
+            }
+        };
+        let loaded = self.fresh();
+        instructions.push(Self::inst(
+            Op::Load,
+            Some(result_ty),
+            Some(loaded),
+            vec![
+                Operand::IdRef(p),
+                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                Operand::LiteralBit32(align),
+            ],
+        ));
+        Ok(loaded)
+    }
+
+    // NVK/NAK requires every PhysicalStorageBuffer load/store to satisfy size_B <= align.
+    // When LLVM specifies a smaller alignment (e.g. 2-byte aligned i32 in 22-byte block_q5_0),
+    // split the access into naturally aligned chunks of size `align`.
+    fn emit_psb_load_value(
+        &mut self,
+        ty: &LlType,
+        addr: Word,
+        align: u32,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let natural = self.device_addr_align(ty);
+        if align >= natural {
+            return self.emit_psb_aligned_load(ty, addr, align, instructions);
+        }
+        if let LlType::Vector(elem, lanes) = ty {
+            let elem_bytes = u64::from(natural);
+            let mut components = Vec::with_capacity(*lanes as usize);
+            for lane in 0..*lanes {
+                let lane_addr =
+                    self.emit_psb_addr_offset(addr, u64::from(lane) * elem_bytes, instructions)?;
+                components.push(self.emit_psb_load_value(elem, lane_addr, align, instructions)?);
+            }
+            let vec_ty = self.type_id(ty)?;
+            let composite = self.fresh();
+            instructions.push(Self::inst(
+                Op::CompositeConstruct,
+                Some(vec_ty),
+                Some(composite),
+                components.into_iter().map(Operand::IdRef).collect(),
+            ));
+            return Ok(composite);
+        }
+        if !matches!(align, 1 | 2 | 4) || !matches!(natural, 2 | 4 | 8) || natural % align != 0 {
+            return self.emit_psb_aligned_load(ty, addr, align, instructions);
+        }
+        let chunk_ll = LlType::Int(align * 8);
+        let int_ll = LlType::Int(natural * 8);
+        let int_ty = self.type_id(&int_ll)?;
+        let count = natural / align;
+        let mut acc = 0 as Word;
+        for k in 0..count {
+            let chunk_addr =
+                self.emit_psb_addr_offset(addr, u64::from(k * align), instructions)?;
+            let chunk = self.emit_psb_aligned_load(&chunk_ll, chunk_addr, align, instructions)?;
+            let widened = self.fresh();
+            instructions.push(Self::inst(
+                Op::UConvert,
+                Some(int_ty),
+                Some(widened),
+                vec![Operand::IdRef(chunk)],
+            ));
+            let piece = if k == 0 {
+                widened
+            } else {
+                let shift = self.const_uint(k * align * 8)?;
+                let shifted = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ShiftLeftLogical,
+                    Some(int_ty),
+                    Some(shifted),
+                    vec![Operand::IdRef(widened), Operand::IdRef(shift)],
+                ));
+                shifted
+            };
+            acc = if k == 0 {
+                piece
+            } else {
+                let combined = self.fresh();
+                instructions.push(Self::inst(
+                    Op::BitwiseOr,
+                    Some(int_ty),
+                    Some(combined),
+                    vec![Operand::IdRef(acc), Operand::IdRef(piece)],
+                ));
+                combined
+            };
+        }
+        let result_ty = self.type_id(ty)?;
+        if result_ty == int_ty {
+            return Ok(acc);
+        }
+        let op = if matches!(ty, LlType::Ptr(_)) {
+            Op::ConvertUToPtr
+        } else {
+            Op::Bitcast
+        };
+        let cast = self.fresh();
+        instructions.push(Self::inst(
+            op,
+            Some(result_ty),
+            Some(cast),
+            vec![Operand::IdRef(acc)],
+        ));
+        Ok(cast)
+    }
+
+    fn emit_psb_aligned_store(
         &mut self,
         ty: &LlType,
         value: Word,
-        raw: &RawBufferOffset,
+        addr: Word,
+        align: u32,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
-        self.used_device_address = true;
-        let addr = self.materialize_device_address(raw, instructions)?;
         let ptr_ty = self.ptr_type_id(StorageClass::PhysicalStorageBuffer, ty)?;
         let p = self.fresh();
         instructions.push(Self::inst(
@@ -676,7 +819,6 @@ impl Emitter {
             Some(p),
             vec![Operand::IdRef(addr)],
         ));
-        let align = self.device_addr_align(ty);
         instructions.push(Self::inst(
             Op::Store,
             None,
@@ -689,5 +831,102 @@ impl Emitter {
             ],
         ));
         Ok(())
+    }
+
+    fn emit_psb_store_value(
+        &mut self,
+        ty: &LlType,
+        value: Word,
+        addr: Word,
+        align: u32,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let natural = self.device_addr_align(ty);
+        if align >= natural {
+            return self.emit_psb_aligned_store(ty, value, addr, align, instructions);
+        }
+        if let LlType::Vector(elem, lanes) = ty {
+            let elem_ty = self.type_id(elem)?;
+            let elem_bytes = u64::from(natural);
+            for lane in 0..*lanes {
+                let comp = self.fresh();
+                instructions.push(Self::inst(
+                    Op::CompositeExtract,
+                    Some(elem_ty),
+                    Some(comp),
+                    vec![Operand::IdRef(value), Operand::LiteralBit32(lane)],
+                ));
+                let lane_addr =
+                    self.emit_psb_addr_offset(addr, u64::from(lane) * elem_bytes, instructions)?;
+                self.emit_psb_store_value(elem, comp, lane_addr, align, instructions)?;
+            }
+            return Ok(());
+        }
+        if !matches!(align, 1 | 2 | 4) || !matches!(natural, 2 | 4 | 8) || natural % align != 0 {
+            return self.emit_psb_aligned_store(ty, value, addr, align, instructions);
+        }
+        let chunk_ll = LlType::Int(align * 8);
+        let chunk_ty = self.type_id(&chunk_ll)?;
+        let int_ll = LlType::Int(natural * 8);
+        let int_ty = self.type_id(&int_ll)?;
+        let value_ty = self.type_id(ty)?;
+        let int_val = if value_ty == int_ty {
+            value
+        } else {
+            let op = if matches!(ty, LlType::Ptr(_)) {
+                Op::ConvertPtrToU
+            } else {
+                Op::Bitcast
+            };
+            let cast = self.fresh();
+            instructions.push(Self::inst(
+                op,
+                Some(int_ty),
+                Some(cast),
+                vec![Operand::IdRef(value)],
+            ));
+            cast
+        };
+        let count = natural / align;
+        for k in 0..count {
+            let shifted = if k == 0 {
+                int_val
+            } else {
+                let shift = self.const_uint(k * align * 8)?;
+                let s = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ShiftRightLogical,
+                    Some(int_ty),
+                    Some(s),
+                    vec![Operand::IdRef(int_val), Operand::IdRef(shift)],
+                ));
+                s
+            };
+            let chunk = self.fresh();
+            instructions.push(Self::inst(
+                Op::UConvert,
+                Some(chunk_ty),
+                Some(chunk),
+                vec![Operand::IdRef(shifted)],
+            ));
+            let chunk_addr =
+                self.emit_psb_addr_offset(addr, u64::from(k * align), instructions)?;
+            self.emit_psb_aligned_store(&chunk_ll, chunk, chunk_addr, align, instructions)?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::native::emitter) fn emit_device_addr_store(
+        &mut self,
+        ty: &LlType,
+        value: Word,
+        raw: &RawBufferOffset,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        self.used_device_address = true;
+        let addr = self.materialize_device_address(raw, instructions)?;
+        let align = self.device_addr_align_for_access(ty, access_align);
+        self.emit_psb_store_value(ty, value, addr, align, instructions)
     }
 }

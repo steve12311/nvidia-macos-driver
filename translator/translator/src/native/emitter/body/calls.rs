@@ -56,7 +56,7 @@ impl Emitter {
             ));
         }
         let result = self.result_id(name, &result_ty)?;
-        self.emit_device_addr_load(result, &result_ty, &raw, instructions)?;
+        self.emit_device_addr_load(result, &result_ty, &raw, None, instructions)?;
         Ok(true)
     }
 

@@ -154,7 +154,7 @@ pub(super) struct Emitter {
     bda_device_pointers: bool,
     constant_space_load: bool,
     nonwritable_psb_wrappers: HashMap<LlType, Word>,
-    null_bda_load_helpers: HashMap<(LlType, bool), Word>,
+    null_bda_load_helpers: HashMap<(LlType, bool, u32), Word>,
     used_device_address: bool,
 }
 
