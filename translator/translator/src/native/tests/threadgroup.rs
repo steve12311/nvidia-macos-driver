@@ -2163,6 +2163,65 @@ declare void @air.simdgroup_matrix_8x8_store.v64f16.p1f16(<64 x half>, ptr addrs
 }
 
 #[test]
+fn native_simdgroup_matrix_load_roles_skip_unused_layouts() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @k(ptr addrspace(1) %a_ptr, ptr addrspace(1) %b_ptr, ptr addrspace(1) %dst) {
+entry:
+  %a = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %a_ptr, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %b = call <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1) %b_ptr, i64 8, <2 x i64> zeroinitializer, i1 false)
+  %acc = tail call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32(<64 x half> %a, <64 x half> %b, <64 x float> zeroinitializer)
+  call void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float> %acc, ptr addrspace(1) %dst, i64 8, <2 x i64> zeroinitializer, i1 false)
+  ret void
+}
+
+declare <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1), i64, <2 x i64>, i1)
+declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32(<64 x half>, <64 x half>, <64 x float>)
+declare void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float>, ptr addrspace(1), i64, <2 x i64>, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"a_ptr"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"b_ptr"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        Default::default(),
+    )
+    .expect("translate matrix load roles");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    let half_ty = module
+        .types_global_values
+        .iter()
+        .find(|inst| {
+            inst.class.opcode == Op::TypeFloat
+                && inst.operands.first() == Some(&Operand::LiteralBit32(16))
+        })
+        .and_then(|inst| inst.result_id)
+        .expect("half type");
+    let half_loads = module
+        .functions
+        .iter()
+        .flat_map(|func| &func.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|inst| inst.class.opcode == Op::Load && inst.result_type == Some(half_ty))
+        .count();
+    assert_eq!(
+        half_loads, 4,
+        "A-only and B-only half matrix loads should emit 2 loads each (4 total), not 6 each:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_kernel_threadgroup_param_direct_scalar_load_uses_element_zero() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

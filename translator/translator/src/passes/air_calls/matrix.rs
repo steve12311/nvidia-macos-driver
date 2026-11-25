@@ -464,6 +464,149 @@ const MAT8_A: u8 = 0;
 const MAT8_B: u8 = 1;
 const MAT8_C: u8 = 2;
 
+const MAT8_USE_A: u8 = 1 << 0;
+const MAT8_USE_B: u8 = 1 << 1;
+const MAT8_USE_C: u8 = 1 << 2;
+const MAT8_USE_APPLE: u8 = 1 << 3;
+const MAT8_USE_ALL: u8 = MAT8_USE_A | MAT8_USE_B | MAT8_USE_C | MAT8_USE_APPLE;
+
+// Record which layouts each half 8x8 matrix load is actually consumed in so we only emit
+// the needed 2 memory loads instead of 6 (Apple + A/C + B). Unused PhysicalStorageBuffer
+// loads cannot be DCE'd downstream and otherwise triple memory traffic and register pressure.
+pub(in crate::passes) fn plan_mat8_load_roles(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    names: &HashMap<Word, String>,
+) {
+    ctx.mat8_load_roles.clear();
+    if std::env::var_os("NVMTL_MATRIX8_NO_DIRECT").is_some() {
+        return;
+    }
+    let half = ctx.ty_half();
+    let float = ctx.ty_float();
+    let blocks = &ctx.module.functions[entry_idx].blocks;
+    let labels: HashMap<Word, usize> = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| Some((b.label.as_ref()?.result_id?, i)))
+        .collect();
+    let planned_nv_phis: HashSet<Word> = ctx.mat8_nv_phis.iter().map(|p| p.phi).collect();
+    let mut load_block: HashMap<Word, usize> = HashMap::default();
+    let mut roles: HashMap<Word, u8> = HashMap::default();
+    for (bi, block) in blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if inst.class.opcode != Op::FunctionCall {
+                continue;
+            }
+            let (Some(res), Some(rty), Some(Operand::IdRef(callee))) =
+                (inst.result_id, inst.result_type, inst.operands.first())
+            else {
+                continue;
+            };
+            if !names
+                .get(callee)
+                .is_some_and(|n| n.starts_with("air.simdgroup_matrix_8x8_load."))
+            {
+                continue;
+            }
+            if matches!(composite_shape(ctx, rty), Some((elem, 64)) if elem == half) {
+                load_block.insert(res, bi);
+                roles.insert(res, 0);
+            }
+        }
+    }
+    if load_block.is_empty() {
+        return;
+    }
+    let dominance = ctx.air_call_body.as_ref().map(|b| &b.dominance);
+    let mark = |roles: &mut HashMap<Word, u8>, id: Word, bit: u8| {
+        if let Some(entry) = roles.get_mut(&id) {
+            *entry |= bit;
+        }
+    };
+    for (bi, block) in blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            match inst.class.opcode {
+                Op::FunctionCall => {
+                    let callee = match inst.operands.first() {
+                        Some(Operand::IdRef(c)) => names.get(c).map(String::as_str),
+                        _ => None,
+                    };
+                    if let Some(sig) = callee.and_then(crate::air_intrinsics::matrix8_intrinsic) {
+                        if mat8_mma_eligible(sig) && inst.operands.len() == 4 {
+                            for (pos, bit) in [(1, MAT8_USE_A), (2, MAT8_USE_B), (3, MAT8_USE_C)] {
+                                if let Some(Operand::IdRef(v)) = inst.operands.get(pos) {
+                                    let dominated = load_block
+                                        .get(v)
+                                        .is_some_and(|&lb| dominance.is_some_and(|d| d.dominates(lb, bi)));
+                                    mark(&mut roles, *v, if dominated { bit } else { MAT8_USE_APPLE });
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if callee.is_some_and(|n| n.starts_with("air.simdgroup_matrix_8x8_store.")) {
+                        if let Some(Operand::IdRef(v)) = inst.operands.get(1) {
+                            let elem_ok = value_result_type(ctx, *v)
+                                .and_then(|ty| composite_shape(ctx, ty))
+                                .is_some_and(|(e, lanes)| lanes == 64 && (e == half || e == float));
+                            let dominated = load_block
+                                .get(v)
+                                .is_some_and(|&lb| dominance.is_some_and(|d| d.dominates(lb, bi)));
+                            mark(
+                                &mut roles,
+                                *v,
+                                if elem_ok && dominated {
+                                    MAT8_USE_C
+                                } else {
+                                    MAT8_USE_APPLE
+                                },
+                            );
+                        }
+                        for op in inst.operands.iter().skip(2) {
+                            if let Operand::IdRef(v) = op {
+                                mark(&mut roles, *v, MAT8_USE_APPLE);
+                            }
+                        }
+                        continue;
+                    }
+                    for op in &inst.operands {
+                        if let Operand::IdRef(v) = op {
+                            mark(&mut roles, *v, MAT8_USE_APPLE);
+                        }
+                    }
+                }
+                Op::Phi if inst.result_id.is_some_and(|r| planned_nv_phis.contains(&r)) => {
+                    for pair in inst.operands.chunks(2) {
+                        if let [Operand::IdRef(v), Operand::IdRef(l)] = pair {
+                            let dominated = load_block.get(v).zip(labels.get(l)).is_some_and(
+                                |(&lb, &pi)| dominance.is_some_and(|d| d.dominates(lb, pi)),
+                            );
+                            mark(
+                                &mut roles,
+                                *v,
+                                if dominated {
+                                    MAT8_USE_C
+                                } else {
+                                    MAT8_USE_APPLE
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    for op in &inst.operands {
+                        if let Operand::IdRef(v) = op {
+                            mark(&mut roles, *v, MAT8_USE_APPLE);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ctx.mat8_load_roles = roles;
+}
+
 fn mat8_mma_eligible(signature: Matrix8Intrinsic) -> bool {
     signature.lhs == Matrix16Element::F16
         && signature.rhs == Matrix16Element::F16
@@ -3880,40 +4023,52 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_load(
         );
     }
     let lane = matrix8_lane(ctx, &mut insts);
-    let mut slots = [0 as Word; 2];
-    for slot in 0..2u32 {
-        let col = matrix8_slot_col(ctx, &mut insts, &lane, slot);
-        slots[slot as usize] = shape.load_cell(
-            ctx,
-            &mut insts,
-            &address,
-            base,
-            elem,
-            lane.row,
-            col,
-            byte_cursor,
-        );
-    }
-    if elem == ctx.ty_half() && std::env::var_os("NVMTL_MATRIX8_NO_DIRECT").is_none() {
+    let direct_half = elem == ctx.ty_half() && std::env::var_os("NVMTL_MATRIX8_NO_DIRECT").is_none();
+    let roles = if direct_half {
+        ctx.mat8_load_roles.get(&res).copied().unwrap_or(MAT8_USE_ALL)
+    } else {
+        MAT8_USE_APPLE
+    };
+    let slots = if (roles & MAT8_USE_APPLE) != 0 {
+        let mut loaded = [0 as Word; 2];
+        for slot in 0..2u32 {
+            let col = matrix8_slot_col(ctx, &mut insts, &lane, slot);
+            loaded[slot as usize] = shape.load_cell(
+                ctx,
+                &mut insts,
+                &address,
+                base,
+                elem,
+                lane.row,
+                col,
+                byte_cursor,
+            );
+        }
+        loaded
+    } else {
+        let zero = ctx.const_half(0.0);
+        [zero, zero]
+    };
+    if direct_half && (roles & (MAT8_USE_A | MAT8_USE_B | MAT8_USE_C)) != 0 {
         let (g, t2, t2p) = matrix8_nv_coords(ctx, &mut insts, lane.simd_lane);
-        for (role, cells) in [(MAT8_A, [(g, t2), (g, t2p)]), (MAT8_B, [(t2, g), (t2p, g)])] {
-            let mut values = [0 as Word; 2];
-            for (slot, (row, col)) in cells.into_iter().enumerate() {
-                values[slot] = shape.load_cell(
-                    ctx,
-                    &mut insts,
-                    &address,
-                    base,
-                    elem,
-                    row,
-                    col,
-                    byte_cursor,
-                );
+        if (roles & (MAT8_USE_A | MAT8_USE_C)) != 0 {
+            let e = [
+                shape.load_cell(ctx, &mut insts, &address, base, elem, g, t2, byte_cursor),
+                shape.load_cell(ctx, &mut insts, &address, base, elem, g, t2p, byte_cursor),
+            ];
+            if (roles & MAT8_USE_A) != 0 {
+                mat8_nv_record(ctx, res, MAT8_A, e, elem);
             }
-            mat8_nv_record(ctx, res, role, values, elem);
-            if role == MAT8_A {
-                mat8_nv_record(ctx, res, MAT8_C, values, elem);
+            if (roles & MAT8_USE_C) != 0 {
+                mat8_nv_record(ctx, res, MAT8_C, e, elem);
             }
+        }
+        if (roles & MAT8_USE_B) != 0 {
+            let e = [
+                shape.load_cell(ctx, &mut insts, &address, base, elem, t2, g, byte_cursor),
+                shape.load_cell(ctx, &mut insts, &address, base, elem, t2p, g, byte_cursor),
+            ];
+            mat8_nv_record(ctx, res, MAT8_B, e, elem);
         }
     }
     matrix8_pack(ctx, &mut insts, elem, rty, res, slots);

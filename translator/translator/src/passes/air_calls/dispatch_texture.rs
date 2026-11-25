@@ -17,6 +17,7 @@ pub(in crate::passes) fn lower_air_calls(ctx: &mut Ctx, entry_idx: usize) -> Res
     });
     plan_mat8_nv_phis(ctx, entry_idx, &names);
     plan_mat8_fusion(ctx, entry_idx, &names);
+    plan_mat8_load_roles(ctx, entry_idx, &names);
     let sampler_selects = sampler_select_defs(ctx, entry_idx);
     for bi in 0..n_blocks {
         ctx.air_call_block = bi;
