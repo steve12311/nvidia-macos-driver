@@ -4427,6 +4427,74 @@ entry:
 }
 
 #[test]
+fn native_dynamic_local_table_reads_byte_offsets_from_both_slots() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%block = type { i32, i32 }
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %out, <3 x i32> %grid) {
+entry:
+  %table = alloca [2 x ptr addrspace(1)], align 8
+  %x = extractelement <3 x i32> %grid, i32 0
+  %bit = and i32 %x, 1
+  %index = zext i32 %bit to i64
+  %offset = shl i64 %index, 3
+  %a = getelementptr inbounds i8, ptr addrspace(1) %src, i64 %offset
+  %b = getelementptr inbounds i8, ptr addrspace(1) %a, i64 8
+  store ptr addrspace(1) %a, ptr %table, align 8
+  %one = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 1
+  store ptr addrspace(1) %b, ptr %one, align 8
+  %slot = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 %index
+  %base = load ptr addrspace(1), ptr %slot, align 8
+  %next = getelementptr inbounds %block, ptr addrspace(1) %base, i64 %index, i32 1
+  %value = load i32, ptr addrspace(1) %next, align 4
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"grid"}
+"#;
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
+    let module = load_bytes(&spv).expect("load native spv");
+    let value_types = module
+        .all_inst_iter()
+        .filter_map(|i| Some((i.result_id?, i.result_type?)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut local_stores = 0;
+    let mut local_loads = 0;
+    for instruction in module.all_inst_iter() {
+        let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
+            continue;
+        };
+        if value_types
+            .get(pointer)
+            .and_then(|ty| pointer_type_storage_class(&module, *ty))
+            != Some(spirv::StorageClass::Function)
+        {
+            continue;
+        }
+        if instruction.class.opcode == Op::Store {
+            let Operand::IdRef(value) = instruction.operands[1] else {
+                panic!("expected a stored device address");
+            };
+            assert!(module.all_inst_iter().any(|i| {
+                i.result_id == Some(value) && i.class.opcode == Op::IAdd
+            }));
+        }
+        local_stores += usize::from(instruction.class.opcode == Op::Store);
+        local_loads += usize::from(instruction.class.opcode == Op::Load);
+    }
+    assert_eq!((local_stores, local_loads), (2, 1));
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+}
+
+#[test]
 fn native_selected_i8_buffer_bitcast_vector_load_uses_raw_arms() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

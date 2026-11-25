@@ -512,6 +512,7 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
     for function in &parsed.functions {
         let mut local_ptr_gep_dynamic = HashSet::<String>::default();
         let mut local_ptr_select_or_phi = HashSet::<String>::default();
+        let mut device_byte_geps = HashSet::<String>::default();
         for inst in function.carrier_insts() {
             let Some(result) = inst.result.as_ref() else {
                 continue;
@@ -521,6 +522,9 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
                     && gep.indices.iter().any(|idx| !is_constant_index(&idx.value))
                 {
                     local_ptr_gep_dynamic.insert(result.clone());
+                }
+                if gep.base.ty == LlType::Ptr(1) && gep.source_ty == LlType::Int(8) {
+                    device_byte_geps.insert(result.clone());
                 }
             }
             if matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1 | 2)))
@@ -560,19 +564,26 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
                 }
             }
         }
-        let loads_local_device_ptr = function.carrier_insts().any(|inst| {
-            inst.load().as_deref().is_some_and(|load| {
+        let mut loads_local_device_ptr = false;
+        let mut loads_dynamic_local_device_ptr = false;
+        for inst in function.carrier_insts() {
+            if let Some(load) = inst.load().as_deref().filter(|load| {
                 matches!(load.result_ty, LlType::Ptr(1 | 2))
                     && matches!(load.ptr.ty, LlType::Ptr(0))
-            })
-        });
+            }) {
+                loads_local_device_ptr = true;
+                loads_dynamic_local_device_ptr |= local_is(&load.ptr.value, &local_ptr_gep_dynamic);
+            }
+        }
         if loads_local_device_ptr
             && function.carrier_insts().any(|inst| {
                 inst.store().as_deref().is_some_and(|(value, pointer)| {
                     matches!(value.ty, LlType::Ptr(1 | 2))
                         && matches!(pointer.ty, LlType::Ptr(0))
                         && (local_is(&pointer.value, &local_ptr_gep_dynamic)
-                            || local_is(&value.value, &local_ptr_select_or_phi))
+                            || local_is(&value.value, &local_ptr_select_or_phi)
+                            || (loads_dynamic_local_device_ptr
+                                && local_is(&value.value, &device_byte_geps)))
                 })
             })
         {

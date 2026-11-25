@@ -229,21 +229,44 @@ impl Emitter {
         if !matches!(object_ty, LlType::Ptr(_)) {
             return Ok(false);
         }
-        let leaf = if local_pointer_field_pointee(pointee) {
-            None
+        let (path, pointee) = if local_pointer_field_pointee(pointee) {
+            (Vec::new(), pointee)
         } else {
-            match first_field_pointer_leaf(pointee) {
-                Some((_, leaf)) => Some(leaf.clone()),
-                None => return Ok(false),
-            }
+            let Some(leaf) = first_field_pointer_leaf(pointee) else {
+                return Ok(false);
+            };
+            leaf
         };
-        let pointee = leaf.as_ref().unwrap_or(pointee);
         let Some(key) = self.local_pointer_field_key(ptr)? else {
             return Ok(false);
         };
 
-        let ptr_id = self.value_id(&ptr.value, &ptr.ty)?;
-        if self.bda_device_pointers && *pointee == LlType::Int(64) {
+        let mut ptr_id = self.value_id(&ptr.value, &ptr.ty)?;
+        let mut address_slot = *pointee == LlType::Int(64);
+        if !path.is_empty() {
+            let LlType::Ptr(addrspace) = self.resolve_type(&ptr.ty)? else {
+                return Ok(false);
+            };
+            let storage = self.pointer_storage_for(&ptr.value, addrspace)?;
+            let storage_pointee = if storage == StorageClass::Function {
+                function_storage_local_type(pointee)
+            } else {
+                pointee.clone()
+            };
+            address_slot = storage_pointee == LlType::Int(64);
+            let ptr_type = self.ptr_type_id(storage, &storage_pointee)?;
+            let zero = self.const_uint(0)?;
+            let mut operands = vec![Operand::IdRef(ptr_id)];
+            operands.extend(std::iter::repeat_n(Operand::IdRef(zero), path.len()));
+            ptr_id = self.fresh();
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(ptr_type),
+                Some(ptr_id),
+                operands,
+            ));
+        }
+        if self.bda_device_pointers && address_slot {
             if let Some(address) = self.materialize_bda_pointer_address(&object.value, instructions)?
             {
                 self.emit_sidecar.local_pointer_field_stores.push(
@@ -565,18 +588,19 @@ impl Emitter {
                 index: index_id,
                 suffix: suffix.clone(),
             };
+            if self.bda_forwards_local_pointer_field(result_name, result_ty)
+                && self
+                    .pointer_pointee_for_value(&ptr.value)?
+                    .is_some_and(|pointee| local_pointer_field_pointee(&pointee))
+                && values
+                    .iter()
+                    .all(|(_, value)| self.can_materialize_bda_pointer_address(&value.value))
+            {
+                let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+                self.emit_bda_address_from_field(result_name, pointer, instructions)?;
+                return Ok(true);
+            }
             if values.is_empty() {
-                if self.bda_forwards_local_pointer_field(result_name, result_ty)
-                    && self
-                        .pointer_pointee_for_value(&ptr.value)?
-                        .map(|ty| self.resolve_type(&ty))
-                        .transpose()?
-                        == Some(LlType::Int(64))
-                {
-                    let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
-                    self.emit_bda_address_from_field(result_name, pointer, instructions)?;
-                    return Ok(true);
-                }
                 let LlType::Ptr(addrspace) = result_ty else {
                     return Ok(false);
                 };
@@ -1722,8 +1746,12 @@ fn local_pointer_field_pointee(pointee: &LlType) -> bool {
 fn first_field_pointer_leaf(pointee: &LlType) -> Option<(Vec<u32>, &LlType)> {
     let mut indices = Vec::new();
     let mut leaf = pointee;
-    while let LlType::Struct(members) = leaf {
-        leaf = members.first()?;
+    loop {
+        leaf = match leaf {
+            LlType::Struct(members) => members.first()?,
+            LlType::Array(element, len) if *len > 0 => element,
+            _ => break,
+        };
         indices.push(0);
     }
     (!indices.is_empty() && local_pointer_field_pointee(leaf)).then_some((indices, leaf))
