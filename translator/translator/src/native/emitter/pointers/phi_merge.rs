@@ -120,6 +120,26 @@ impl Emitter {
                 {
                     return true;
                 }
+                if let Some(gep) = self.forward_geps.get(name).cloned() {
+                    if !visiting.insert(name.clone()) {
+                        return true;
+                    }
+                    let addressable =
+                        self.bda_phi_value_is_addressable_inner(&gep.base.value, visiting);
+                    visiting.remove(name);
+                    return addressable;
+                }
+                if let Some((true_val, false_val)) = self.forward_pointer_selects.get(name).cloned()
+                {
+                    if !visiting.insert(name.clone()) {
+                        return true;
+                    }
+                    let addressable = self
+                        .bda_phi_value_is_addressable_inner(&true_val.value, visiting)
+                        && self.bda_phi_value_is_addressable_inner(&false_val.value, visiting);
+                    visiting.remove(name);
+                    return addressable;
+                }
                 let Some(incoming) = self.tir_phi_incomings.get(name) else {
                     return false;
                 };
@@ -1023,6 +1043,15 @@ impl Emitter {
             }
             provenances[position] = Some(provenance);
         }
+        for (position, (value, _)) in incoming.iter().enumerate() {
+            if provenances[position].is_some() {
+                continue;
+            }
+            let mut visited = crate::fxhash::set_from([name.to_string()]);
+            if !self.forward_pointer_matches_template(value, &template, &mut visited) {
+                return Ok(None);
+            }
+        }
         let prior_provenance = self.gep_provenance.get(name).cloned();
         let index_names = if template.indices.len() == 1 {
             vec![pointer_index_name(name)]
@@ -1148,6 +1177,110 @@ impl Emitter {
             root_indices: None,
             root_is_indexed_container: template.root_is_indexed_container,
         }))
+    }
+
+    fn forward_pointer_matches_template(
+        &self,
+        value: &LlValue,
+        template: &GepProvenance,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        let resolved = self.forwarded_pointer_value(value);
+        match resolved {
+            LlValue::Undef => true,
+            LlValue::Local(local) => {
+                if let Some(provenance) = self.gep_provenance.get(&local) {
+                    return compatible_pointer_provenance(template, provenance)
+                        && provenance
+                            .indices
+                            .iter()
+                            .zip(&template.indices)
+                            .all(|(index, template_index)| index.ty == template_index.ty);
+                }
+                if let Some((id, _)) = self.values.get(&local) {
+                    return template.indices.len() == 1 && *id == template.root;
+                }
+                if !visited.insert(local.clone()) {
+                    return true;
+                }
+                if let Some(incoming) = self.tir_phi_incomings.get(&local) {
+                    return incoming.iter().all(|(arm, _)| {
+                        self.forward_pointer_matches_template(arm, template, visited)
+                    });
+                }
+                if let Some(gep) = self.forward_geps.get(&local) {
+                    let Ok(LlType::Ptr(addrspace)) = self.resolve_type(&gep.base.ty) else {
+                        return false;
+                    };
+                    if addrspace != template.addrspace {
+                        return false;
+                    }
+                    let Ok(source_ty) = self.resolve_type(&gep.source_ty) else {
+                        return false;
+                    };
+                    if let LlValue::Local(base_name) = &gep.base.value {
+                        if self
+                            .values
+                            .get(base_name)
+                            .is_some_and(|(id, _)| *id == template.root)
+                            && gep.indices.len() == template.indices.len()
+                            && source_ty == template.source_ty
+                            && gep.indices.iter().zip(&template.indices).all(|(a, b)| {
+                                self.resolve_type(&a.ty).ok().as_ref() == Some(&b.ty)
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                    if gep.indices.len() != 1 {
+                        return false;
+                    }
+                    let can_compose = (gep_pointee(&template.source_ty, &template.indices)
+                        .ok()
+                        .as_ref()
+                        == Some(&source_ty)
+                        && gep_can_offset_element_pointer(
+                            &template.source_ty,
+                            &template.indices,
+                            &source_ty,
+                        ))
+                        || (template.indices.len() == 1
+                            && template.source_ty == LlType::Int(8)
+                            && matches!(template.addrspace, 1..=3)
+                            && is_byte_view_scalar_or_vector_source(&source_ty));
+                    if !can_compose {
+                        return false;
+                    }
+                    let idx_ok = match (
+                        self.resolve_type(&gep.indices[0].ty),
+                        template.indices.last().map(|idx| &idx.ty),
+                    ) {
+                        (Ok(LlType::Int(got_bits)), Some(LlType::Int(want_bits))) => {
+                            got_bits <= *want_bits
+                        }
+                        _ => false,
+                    };
+                    return idx_ok
+                        && self.forward_pointer_matches_template(
+                            &gep.base.value,
+                            template,
+                            visited,
+                        );
+                }
+                if let Some((true_val, false_val)) = self.forward_pointer_selects.get(&local) {
+                    if template.indices.len() != 1 {
+                        return false;
+                    }
+                    let arm_ok = |arm: &LlValue, visited: &mut HashSet<String>| {
+                        matches!(arm, LlValue::Zero)
+                            || self.forward_pointer_matches_template(arm, template, visited)
+                    };
+                    return arm_ok(&true_val.value, visited) && arm_ok(&false_val.value, visited);
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn restore_pointer_phi_reservation(

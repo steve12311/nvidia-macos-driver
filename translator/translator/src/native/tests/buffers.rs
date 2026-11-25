@@ -14669,6 +14669,69 @@ entry:
 }
 
 #[test]
+fn native_loop_carried_byte_view_and_cross_binding_pointer_phis_validate() {
+    // Models Flash Attention kvpad=1: a loop-carried pointer phi stepping by <2 x half> over
+    // a byte-addressed buffer alongside a cross-binding pointer phi switching from mask to pad.
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define void @k(ptr addrspace(1) %mask, ptr addrspace(1) %pad, ptr addrspace(1) %out, i32 %tid) {
+entry:
+  %m0 = getelementptr inbounds i8, ptr addrspace(1) %mask, i64 4
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next_i, %latch ]
+  %p = phi ptr addrspace(1) [ %m0, %entry ], [ %p_next, %latch ]
+  %v = load <2 x half>, ptr addrspace(1) %p, align 4
+  %s = extractelement <2 x half> %v, i32 0
+  %use_pad = icmp eq i32 %i, 2
+  br i1 %use_pad, label %switch_pad, label %step_same
+
+switch_pad:
+  %p_pad = getelementptr inbounds i8, ptr addrspace(1) %pad, i64 8
+  br label %latch
+
+step_same:
+  %p_step = getelementptr inbounds <2 x half>, ptr addrspace(1) %p, i64 1
+  br label %latch
+
+latch:
+  %p_next = phi ptr addrspace(1) [ %p_pad, %switch_pad ], [ %p_step, %step_same ]
+  %next_i = add i32 %i, 1
+  %done = icmp eq i32 %next_i, 4
+  br i1 %done, label %exit, label %loop
+
+exit:
+  %idx = zext i32 %tid to i64
+  %dst = getelementptr inbounds half, ptr addrspace(1) %out, i64 %idx
+  store half %s, ptr addrspace(1) %dst, align 2
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"mask"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"pad"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let spv = crate::translate_native_no_retry_constructed_with_options(
+        ll,
+        Stage::Kernel,
+        Default::default(),
+    )
+    .expect("loop-carried byte-view + cross-binding pointer phi must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &std::env::temp_dir()).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_helper_nullness_tracks_through_derived_gep_without_pointer_phis() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

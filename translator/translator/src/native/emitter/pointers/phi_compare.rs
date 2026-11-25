@@ -230,7 +230,7 @@ impl Emitter {
         Ok(())
     }
 
-    fn forwarded_pointer_value(&self, value: &LlValue) -> LlValue {
+    pub(super) fn forwarded_pointer_value(&self, value: &LlValue) -> LlValue {
         let mut value = value.clone();
         let mut visited = HashSet::default();
         while let LlValue::Local(name) = &value {

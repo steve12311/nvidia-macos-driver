@@ -19,7 +19,38 @@ impl Emitter {
             return Ok(Some(indices));
         }
 
+        if let Some(indices) =
+            self.compose_byte_view_element_gep(name, prev, source, indices, instructions)?
+        {
+            return Ok(Some(indices));
+        }
+
         self.compose_scalar_array_reinterpret_gep(name, prev, source, indices, instructions)
+    }
+
+    pub(in crate::native::emitter) fn compose_byte_view_element_gep(
+        &mut self,
+        name: &str,
+        prev: &GepProvenance,
+        source: &LlType,
+        indices: &[TypedValue],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Vec<TypedValue>>, String> {
+        if prev.indices.len() != 1
+            || indices.len() != 1
+            || !matches!(prev.addrspace, 1..=3)
+            || prev.source_ty != LlType::Int(8)
+            || !is_byte_view_scalar_or_vector_source(source)
+        {
+            return Ok(None);
+        }
+        let (elem_size, _) = self.raw_type_size_align(source)?;
+        let Ok(scale) = u32::try_from(elem_size) else {
+            return Ok(None);
+        };
+        let scaled = self.scale_gep_index(&indices[0], scale, name, instructions)?;
+        let combined = self.combine_gep_indices(&prev.indices[0], &scaled, instructions)?;
+        Ok(Some(vec![combined]))
     }
 
     pub(in crate::native::emitter) fn compose_zero_wrapper_gep(

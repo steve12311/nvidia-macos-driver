@@ -781,6 +781,13 @@ impl Emitter {
         instructions.push(Self::inst(opcode, Some(ptr_type), Some(result), ops));
         self.pointer_storage
             .insert(name.to_string(), access_storage);
+        if was_composed
+            && source_ty == LlType::Int(8)
+            && access_pointee == LlType::Int(8)
+            && !matches!(access_storage, StorageClass::Private | StorageClass::Function)
+        {
+            self.byte_view_pointers.insert(name.to_string());
+        }
         self.pointer_pointees
             .insert(name.to_string(), access_pointee);
         if let LlValue::Local(base_name) = &gep.base.value {

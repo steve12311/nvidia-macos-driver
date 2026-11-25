@@ -647,6 +647,29 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
             return true;
         }
 
+        let has_multi_root_raw = |value: &str| {
+            let roots = pointer_parameter_roots(function, value);
+            roots.len() >= 2
+                && roots.iter().any(|&param_idx| {
+                    function
+                        .params
+                        .get(param_idx)
+                        .is_some_and(|(param_name, _)| {
+                            parsed
+                                .raw_buffer_params
+                                .contains(&(function.name.clone(), param_name.clone()))
+                        })
+                })
+        };
+        if function.carrier_insts().any(|inst| {
+            if inst.opcode == "phi" && matches!(inst.result_ty.as_ref(), Some(LlType::Ptr(1))) {
+                return inst.result.as_deref().is_some_and(has_multi_root_raw);
+            }
+            false
+        }) {
+            return true;
+        }
+
         let mut raw_param_offsets = function
             .params
             .iter()
