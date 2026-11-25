@@ -114,6 +114,17 @@ static nvmtl_spec_fn xlate_spec;
 static nvmtl_spec_apply_fn xlate_spec_apply;
 static nvmtl_refl_fn xlate_refl;
 static nvmtl_refl_fc_fn xlate_refl_fc;
+typedef void (*nvmtl_set_caps_fn)(uint32_t);
+static _Atomic nvmtl_set_caps_fn xlate_set_caps;
+static _Atomic uint32_t gXlateBaseCaps;
+static _Atomic uint32_t gXlateSubwordCaps;
+
+static void nvmtl_xlate_set_subword_caps(int has_int8, int has_int16, int has_float16) {
+    uint32_t sub = 0x10u | (has_int8 ? 0x20u : 0u) | (has_int16 ? 0x40u : 0u) | (has_float16 ? 0x80u : 0u);
+    atomic_store(&gXlateSubwordCaps, sub);
+    nvmtl_set_caps_fn fn = atomic_load(&xlate_set_caps);
+    if (fn) fn(atomic_load(&gXlateBaseCaps) | sub);
+}
 typedef int (*nvmtl_vrefs_fn)(const char *, uint8_t **, size_t *, char *, size_t);
 typedef int (*nvmtl_link_fn)(const char *, const char *, const char *const *, const char *const *, size_t, uint8_t **, size_t *, char *, size_t);
 static nvmtl_vrefs_fn xlate_vrefs;
@@ -189,11 +200,15 @@ static int nvmtl_xlate_ready(void) {
         if (!xlate_link) nvlog("translate: no nvmtl_link_visible in this translator — kernels with visible-function references cannot be linked");
         xlate_refl = (nvmtl_refl_fn)dlsym(h, "nvmtl_reflect");
         xlate_refl_fc = (nvmtl_refl_fc_fn)dlsym(h, "nvmtl_reflect_fc");
-        void (*setcaps)(uint32_t) = (void (*)(uint32_t))dlsym(h, "nvmtl_translate_set_caps");
+        nvmtl_set_caps_fn setcaps = (nvmtl_set_caps_fn)dlsym(h, "nvmtl_translate_set_caps");
         // Bits 0/1: formatless storage images. Bit 2: this plugin has no rasterization rate maps.
         // Bit 3: heap slots 1..5 are reserved for typed dummies (nvmtl_vk.c), a null resource id may be redirected to them.
+        // Bits 4..7: explicit device subword load capabilities (int8/int16/float16), updated once nvmtl_vk_init queries Vulkan.
         { extern int nvmtl_typed_dummies_wanted(void);
-          if (setcaps) setcaps(3u | 4u | (nvmtl_typed_dummies_wanted() ? 8u : 0u)); }
+          uint32_t base = 3u | 4u | (nvmtl_typed_dummies_wanted() ? 8u : 0u);
+          atomic_store(&gXlateBaseCaps, base);
+          atomic_store(&xlate_set_caps, setcaps);
+          if (setcaps) setcaps(base | atomic_load(&gXlateSubwordCaps)); }
         if (!setcaps) nvlog("translate: no nvmtl_translate_set_caps in this translator — written textures stay R32f-declared (one channel)");
         if (!xlate) { nvlog("translate: no nvmtl_translate symbol"); return; }
         nvlog("translate: in-process AIR->SPIR-V library loaded");

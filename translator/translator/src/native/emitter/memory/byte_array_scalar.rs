@@ -1,6 +1,81 @@
 use super::*;
 
 impl Emitter {
+    fn try_emit_raw_psb_subword_load(
+        &mut self,
+        result: Word,
+        ty: &LlType,
+        raw: &RawBufferOffset,
+        extra_byte: u64,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if std::env::var_os("NVMTL_NO_SUBWORD_BDA_LOAD").is_some()
+            || self.raw_access_storage(raw)? != StorageClass::PhysicalStorageBuffer
+        {
+            return Ok(false);
+        }
+        let (load_ty, elem_size) = match ty {
+            LlType::Int(8) => (LlType::Int(8), 1u32),
+            LlType::Int(16) | LlType::BFloat => (LlType::Int(16), 2u32),
+            LlType::Half => (LlType::Half, 2u32),
+            _ => return Ok(false),
+        };
+        if !self.raw_subword_access_aligned(raw, extra_byte, elem_size, access_align) {
+            return Ok(false);
+        }
+        if raw.device_addr_base.is_some() {
+            let mut adjusted = raw.clone();
+            adjusted.const_off = adjusted
+                .const_off
+                .checked_add(i64::try_from(extra_byte).map_err(|_| {
+                    "native emitter: raw physical buffer extra byte offset overflow"
+                })?)
+                .ok_or("native emitter: raw physical buffer offset overflow")?;
+            self.emit_device_addr_load(result, &load_ty, &adjusted, access_align, instructions)?;
+            return Ok(true);
+        }
+        let root_id = self.raw_root_value_id(raw)?;
+        self.used_device_address = true;
+        let i64_ty = self.type_id(&LlType::Int(64))?;
+        let base_addr = self.fresh();
+        instructions.push(Self::inst(
+            Op::ConvertPtrToU,
+            Some(i64_ty),
+            Some(base_addr),
+            vec![Operand::IdRef(root_id)],
+        ));
+        let addr = if raw.dyn_terms.is_empty() && raw.const_off + extra_byte as i64 == 0 {
+            base_addr
+        } else {
+            let byte_index = self.emit_raw_byte_index(raw, extra_byte, instructions)?;
+            let off64 = self.fresh();
+            instructions.push(Self::inst(
+                Op::UConvert,
+                Some(i64_ty),
+                Some(off64),
+                vec![Operand::IdRef(byte_index)],
+            ));
+            let sum = self.fresh();
+            instructions.push(Self::inst(
+                Op::IAdd,
+                Some(i64_ty),
+                Some(sum),
+                vec![Operand::IdRef(base_addr), Operand::IdRef(off64)],
+            ));
+            sum
+        };
+        let loaded = self.emit_psb_aligned_load(&load_ty, addr, elem_size, instructions)?;
+        let result_type = self.type_id(&load_ty)?;
+        instructions.push(Self::inst(
+            Op::CopyObject,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(loaded)],
+        ));
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_raw_scalar_load(
         &mut self,
         result: Word,
@@ -12,6 +87,16 @@ impl Emitter {
     ) -> Result<(), String> {
         let ty = self.resolve_type(ty)?;
         if self.emit_raw_byte_array_integer_load(result, &ty, raw, extra_byte, instructions)? {
+            return Ok(());
+        }
+        if self.try_emit_raw_psb_subword_load(
+            result,
+            &ty,
+            raw,
+            extra_byte,
+            access_align,
+            instructions,
+        )? {
             return Ok(());
         }
         match ty {

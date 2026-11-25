@@ -673,7 +673,7 @@ impl Emitter {
         Ok(out)
     }
 
-    fn emit_psb_aligned_load(
+    pub(in crate::native::emitter) fn emit_psb_aligned_load(
         &mut self,
         ty: &LlType,
         addr: Word,

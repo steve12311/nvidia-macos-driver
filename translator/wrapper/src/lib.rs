@@ -7,6 +7,23 @@ static CAPS: AtomicU32 = AtomicU32::new(0);
 #[no_mangle]
 pub extern "C" fn nvmtl_translate_set_caps(caps: u32) { CAPS.store(caps, Ordering::Relaxed); }
 
+pub(crate) fn subword_caps() -> subword_loads::Caps {
+    let caps = CAPS.load(Ordering::Relaxed);
+    // Bit 4 indicates the host explicitly reported device subword capabilities in bits 5..7
+    // (bit 5: shaderInt8, bit 6: shaderInt16, bit 7: shaderFloat16). Legacy callers leave
+    // bit 4 clear, in which case subword lowering still requires the module's own SPIR-V
+    // capabilities (Int8/Int16/Float16) to be declared.
+    if caps & 0x10 != 0 {
+        subword_loads::Caps {
+            int8: caps & 0x20 != 0,
+            int16: caps & 0x40 != 0,
+            float16: caps & 0x80 != 0,
+        }
+    } else {
+        subword_loads::Caps::default()
+    }
+}
+
 const NVMTL_TG_MAX: usize = 32;
 thread_local! {
     static TG_LEN: std::cell::RefCell<[u32; NVMTL_TG_MAX]> = const {
@@ -719,6 +736,7 @@ pub extern "C" fn nvmtl_reflect_fc(
 
 mod buffer_addresses;
 mod wide_loads;
+mod subword_loads;
 mod align_guard;
 mod table_ubo;
 mod g2_inline;
@@ -1608,5 +1626,130 @@ entry:
         validate_spv(&lowered);
         let ubo = table_ubo::convert(&lowered).expect("table_ubo");
         validate_spv(&ubo);
+    }
+
+    #[test]
+    fn subword_bda_loads_lower_native_8_and_16bit_while_kept_descriptor_buffers_stay_word_backed() {
+        // src0 is indexed by a value loaded from args (kept as a StorageBuffer descriptor under
+        // default keep_data_indexed=true, lowered to PhysicalStorageBuffer under full-BDA flag 8).
+        // src1 is indexed only by tid (always lowered to PhysicalStorageBuffer).
+        let ll = r#"
+target triple = "air64_v28-apple-macosx26.7.0"
+%struct.Args = type { i32 }
+
+define void @kernel_subword_mixed(ptr addrspace(2) %args, ptr addrspace(1) %src0, ptr addrspace(1) %src1, ptr addrspace(1) %dst, i32 %tid, i32 %lid) {
+entry:
+  %stride = load i32, ptr addrspace(2) %args, align 4
+  %off0 = mul i32 %tid, %stride
+  %off0_64 = zext i32 %off0 to i64
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src0, i64 %off0_64
+  %v0 = load i16, ptr addrspace(1) %p0, align 2
+
+  %off1_16 = mul i32 %lid, 2
+  %off1_64 = zext i32 %off1_16 to i64
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %src1, i64 %off1_64
+  %v1 = load half, ptr addrspace(1) %p1, align 2
+  %p2 = getelementptr inbounds i8, ptr addrspace(1) %src1, i64 %off1_64
+  %v2 = load i8, ptr addrspace(1) %p2, align 1
+
+  %v0_f = sitofp i16 %v0 to float
+  %v1_f = fpext half %v1 to float
+  %v2_u = zext i8 %v2 to i32
+  %v2_f = uitofp i32 %v2_u to float
+  %s0 = fadd float %v0_f, %v1_f
+  %s1 = fadd float %s0, %v2_f
+  %tid64 = zext i32 %tid to i64
+  %dp = getelementptr inbounds float, ptr addrspace(1) %dst, i64 %tid64
+  store float %s1, ptr addrspace(1) %dp, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel_subword_mixed, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7, !8}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src0"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src1"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!7 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+!8 = !{i32 5, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+        let spv = translate_one(ll, Stage::Kernel).expect("translate kernel_subword_mixed");
+        validate_spv(&spv);
+
+        // Default lowering: src0 stays a StorageBuffer descriptor (keeps word-backed subword path),
+        // while src1 lowers to PhysicalStorageBuffer and gets native half & i8 loads.
+        let def = buffer_addresses::lower(&spv).expect("default lower");
+        validate_spv(&def);
+        let ubo_def = table_ubo::convert(&def).expect("table_ubo default");
+        validate_spv(&ubo_def);
+        let md = rspirv::dr::load_bytes(&def).unwrap();
+        let td: std::collections::HashMap<u32, rspirv::dr::Instruction> = md
+            .types_global_values
+            .iter()
+            .filter_map(|i| Some((i.result_id?, i.clone())))
+            .collect();
+        let body_def: Vec<_> = md.functions[0].blocks.iter().flat_map(|b| &b.instructions).collect();
+        let has_load = |body: &[&rspirv::dr::Instruction], types: &std::collections::HashMap<u32, rspirv::dr::Instruction>, op: rspirv::spirv::Op, width: u32, align: u32| {
+            body.iter().any(|i| {
+                i.class.opcode == rspirv::spirv::Op::Load
+                    && i.result_type.and_then(|t| types.get(&t)).is_some_and(|t| {
+                        t.class.opcode == op && t.operands.first() == Some(&rspirv::dr::Operand::LiteralBit32(width))
+                    })
+                    && i.operands.get(2) == Some(&rspirv::dr::Operand::LiteralBit32(align))
+            })
+        };
+        assert!(has_load(&body_def, &td, rspirv::spirv::Op::TypeFloat, 16, 2), "src1 half must use native PSB OpLoad Aligned 2");
+        assert!(has_load(&body_def, &td, rspirv::spirv::Op::TypeInt, 8, 1), "src1 i8 must use native PSB OpLoad Aligned 1");
+        assert!(
+            !has_load(&body_def, &td, rspirv::spirv::Op::TypeInt, 16, 2),
+            "kept StorageBuffer src0 must preserve word-backed layout under default lowering"
+        );
+
+        // Full-BDA lowering (keep_data_indexed=false): src0 also lowers to PhysicalStorageBuffer
+        // and emits native 16-bit OpLoad Aligned 2 with zero UDiv / VectorExtractDynamic.
+        let full = buffer_addresses::lower_with_options(&spv, false).expect("full-BDA lower");
+        validate_spv(&full);
+        let ubo_full = table_ubo::convert(&full).expect("table_ubo full");
+        validate_spv(&ubo_full);
+        let mf = rspirv::dr::load_bytes(&full).unwrap();
+        let tf: std::collections::HashMap<u32, rspirv::dr::Instruction> = mf
+            .types_global_values
+            .iter()
+            .filter_map(|i| Some((i.result_id?, i.clone())))
+            .collect();
+        let body_full: Vec<_> = mf.functions[0].blocks.iter().flat_map(|b| &b.instructions).collect();
+        assert!(has_load(&body_full, &tf, rspirv::spirv::Op::TypeInt, 16, 2), "full-BDA src0 i16 must use native PSB OpLoad Aligned 2");
+        assert!(has_load(&body_full, &tf, rspirv::spirv::Op::TypeFloat, 16, 2), "full-BDA src1 half must use native PSB OpLoad Aligned 2");
+        assert!(has_load(&body_full, &tf, rspirv::spirv::Op::TypeInt, 8, 1), "full-BDA src1 i8 must use native PSB OpLoad Aligned 1");
+        assert!(
+            !body_full
+                .iter()
+                .any(|i| i.class.opcode == rspirv::spirv::Op::VectorExtractDynamic),
+            "full-BDA subword loads must eliminate all VectorExtractDynamic"
+        );
+        let psb_u32_loads_full = body_full
+            .iter()
+            .filter(|i| {
+                i.class.opcode == rspirv::spirv::Op::Load
+                    && i.operands.get(1)
+                        == Some(&rspirv::dr::Operand::MemoryAccess(
+                            rspirv::spirv::MemoryAccess::ALIGNED,
+                        ))
+                    && i.result_type.and_then(|t| tf.get(&t)).is_some_and(|t| {
+                        t.class.opcode == rspirv::spirv::Op::TypeInt
+                            && t.operands
+                                == [
+                                    rspirv::dr::Operand::LiteralBit32(32),
+                                    rspirv::dr::Operand::LiteralBit32(0),
+                                ]
+                    })
+            })
+            .count();
+        assert_eq!(
+            psb_u32_loads_full, 1,
+            "full-BDA subword loads must leave only args.stride as a 32-bit PSB load (got {psb_u32_loads_full})"
+        );
     }
 }

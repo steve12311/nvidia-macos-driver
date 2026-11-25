@@ -149,7 +149,7 @@ static int g_dlss_exts;   // the device was created with the extensions DLSS nee
 static int g_hz_dynr;   // the device enabled dynamicRendering (hazard-model passes begin with vkCmdBeginRendering)
 static int g_host_query_reset, g_occlusion_precise;
 static int g_atomic64_buffer, g_atomic64_shared;
-static int g_coop_matrix, g_float16, g_vulkan_memory_model, g_vulkan_memory_device_scope, g_storage16, g_uniform_storage16;
+static int g_coop_matrix, g_float16, g_int8, g_int16, g_storage8, g_vulkan_memory_model, g_vulkan_memory_device_scope, g_storage16, g_uniform_storage16;
 static int g_bindless;
 static VkPhysicalDeviceMemoryProperties g_memp;
 static uint32_t g_qfam = UINT32_MAX;
@@ -875,7 +875,8 @@ static int nvmtl_spirv_ok(const void *p, size_t n, const char *what)
             if (!count || count > words - i) return 0;
             if (op == 17 && count == 2) {
                 uint32_t cap = w[i + 1];
-                int supported = cap == 9 ? g_float16 : cap == 4433 ? g_storage16 : cap == 4434 ? g_uniform_storage16 :
+                int supported = cap == 9 ? g_float16 : cap == 22 ? g_int16 : cap == 39 ? g_int8 :
+                                cap == 4433 ? g_storage16 : cap == 4434 ? g_uniform_storage16 : cap == 4448 ? g_storage8 :
                                 cap == 5345 ? g_vulkan_memory_model : cap == 5346 ? g_vulkan_memory_device_scope :
                                 cap == 6022 ? g_coop_matrix : 1;
                 if (!supported) { nvlog("vk: %s requires unavailable enabled capability %u", what, cap); return 0; }
@@ -1362,6 +1363,9 @@ static int nvmtl_vk_initialize(void)
         if (gpf2) gpf2(g_pdev, &f2);
         v12.shaderFloat16 = q12.shaderFloat16;
         v12.shaderInt8 = q12.shaderInt8;
+        v12.storageBuffer8BitAccess = q12.storageBuffer8BitAccess;
+        g_int8 = q12.shaderInt8 == VK_TRUE;
+        g_storage8 = q12.storageBuffer8BitAccess == VK_TRUE;
         // NVMTL_HAZARD passes begin with vkCmdBeginRendering: enabled only when the model acts; the census only needs to
         // know the device supports it
         g_hz_dynr = q13.dynamicRendering == VK_TRUE;
@@ -1449,6 +1453,10 @@ static int nvmtl_vk_initialize(void)
     VkPhysicalDeviceFeatures supported; pvkGetPhysicalDeviceFeatures(g_pdev, &supported);
     if (!supported.shaderInt64) { nvlog("vk: 64-bit shader addresses unavailable"); return -1; }
     VkPhysicalDeviceFeatures enabled = {0}; enabled.shaderInt64 = VK_TRUE;
+    enabled.shaderInt16 = supported.shaderInt16;
+    g_int16 = supported.shaderInt16 == VK_TRUE;
+    nvmtl_xlate_set_subword_caps(g_int8, g_int16, g_float16);
+    nvlog("vk: subword shader features: int8 %d (storage8 %d), int16 %d, float16 %d", g_int8, g_storage8, g_int16, g_float16);
     enabled.sampleRateShading = supported.sampleRateShading;
     enabled.occlusionQueryPrecise = supported.occlusionQueryPrecise;
     g_occlusion_precise = supported.occlusionQueryPrecise == VK_TRUE;

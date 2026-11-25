@@ -111,9 +111,17 @@ pub fn lower(bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 pub fn lower_with_options(bytes: &[u8], keep_data_indexed: bool) -> Result<Vec<u8>, String> {
+    lower_with_caps(bytes, keep_data_indexed, crate::subword_caps())
+}
+
+pub fn lower_with_caps(
+    bytes: &[u8],
+    keep_data_indexed: bool,
+    subword_caps: crate::subword_loads::Caps,
+) -> Result<Vec<u8>, String> {
     match crate::linearize::apply(bytes) {
-        Ok((lin, _why)) => lower_addresses(&lin, keep_data_indexed),
-        Err(_) => lower_addresses(bytes, keep_data_indexed),
+        Ok((lin, _why)) => lower_addresses(&lin, keep_data_indexed, subword_caps),
+        Err(_) => lower_addresses(bytes, keep_data_indexed, subword_caps),
     }
 }
 /// A table the translator declared at TABLE_BINDING that buffer addresses can be read from: a StorageBuffer variable
@@ -144,7 +152,11 @@ fn existing_table(defs: &HashMap<u32, Instruction>, m: &rspirv::dr::Module, tv: 
     }
 }
 
-fn lower_addresses(bytes: &[u8], keep_data_indexed: bool) -> Result<Vec<u8>, String> {
+fn lower_addresses(
+    bytes: &[u8],
+    keep_data_indexed: bool,
+    subword_caps: crate::subword_loads::Caps,
+) -> Result<Vec<u8>, String> {
     let mut m = rspirv::dr::load_bytes(bytes).map_err(|e| e.to_string())?;
     let defs: HashMap<_,_> = m.types_global_values.iter().filter_map(|i| i.result_id.map(|n|(n,i.clone()))).collect();
     let sb_types: HashMap<u32,u32> = defs.iter().filter_map(|(&n,i)| {
@@ -292,6 +304,7 @@ fn lower_addresses(bytes: &[u8], keep_data_indexed: bool) -> Result<Vec<u8>, Str
         f.blocks[0].instructions.splice(at..at,prelude);
     }
     if std::env::var_os("NVMTL_NO_WIDE_WORD_LOAD").is_none() { crate::wide_loads::fuse(&mut m, &mut next, uint, ulong, &wide_hints); }
+    if std::env::var_os("NVMTL_NO_SUBWORD_BDA_LOAD").is_none() { crate::subword_loads::lower(&mut m, &mut next, uint, ulong, subword_caps); }
     m.header.as_mut().unwrap().bound=next;
     let result:Vec<u8>=m.assemble().iter().flat_map(|w|w.to_le_bytes()).collect();
     metal2vulkan::canonicalize_spirv_bytes(&result)
