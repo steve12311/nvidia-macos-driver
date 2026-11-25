@@ -251,15 +251,35 @@ impl Emitter {
         Ok(())
     }
 
+    pub(in crate::native::emitter) fn raw_subword_access_aligned(
+        &self,
+        raw: &RawBufferOffset,
+        extra_byte: u64,
+        element_size: u32,
+        access_align: Option<u64>,
+    ) -> bool {
+        let align = u64::from(element_size);
+        self.raw_offset_aligned_to(raw, extra_byte, align)
+            || (!raw.unmodelable
+                && access_align.unwrap_or(1) >= align
+                && extra_byte.is_multiple_of(align))
+    }
+
     pub(in crate::native::emitter) fn emit_raw_subword_source(
         &mut self,
         raw: &RawBufferOffset,
         extra_byte: u64,
         element_size: u32,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(Word, RawSubwordLane), String> {
-        let (_, word, lane) =
-            self.emit_raw_subword_target(raw, extra_byte, element_size, instructions)?;
+        let (_, word, lane) = self.emit_raw_subword_target(
+            raw,
+            extra_byte,
+            element_size,
+            access_align,
+            instructions,
+        )?;
         Ok((word, lane))
     }
 
@@ -268,6 +288,7 @@ impl Emitter {
         raw: &RawBufferOffset,
         extra_byte: u64,
         element_size: u32,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(Word, Word, RawSubwordLane), String> {
         let off = raw.const_off + extra_byte as i64;
@@ -275,7 +296,7 @@ impl Emitter {
             .dyn_terms
             .iter()
             .any(|(index, stride)| !self.raw_dynamic_term_word_aligned(index, *stride));
-        if !self.raw_offset_aligned_to(raw, extra_byte, element_size as u64) {
+        if !self.raw_subword_access_aligned(raw, extra_byte, element_size, access_align) {
             return Err(format!(
                 "native emitter: raw byte offset is not {element_size}-byte aligned"
             ));
@@ -300,6 +321,10 @@ impl Emitter {
             vec![Operand::IdRef(byte_index), Operand::IdRef(word_divisor)],
         ));
         let word = self.emit_raw_word_load_at_index(raw, word_index, instructions)?;
+        if access_align.unwrap_or(1) >= 4 {
+            let static_lane = (extra_byte % 4) as u32 / element_size;
+            return Ok((word_index, word, RawSubwordLane::Static(static_lane)));
+        }
         let masked = self.fresh();
         let lane_mask = self.const_uint(3)?;
         instructions.push(Self::inst(

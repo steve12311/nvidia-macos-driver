@@ -15271,3 +15271,63 @@ merge:
     }
     let _ = std::fs::remove_dir_all(tmp);
 }
+
+#[test]
+fn native_raw_i16_load_with_proven_align2_uses_single_word_dynamic_lane() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define i16 @load_aligned_u16(ptr addrspace(1) %p, i32 %byte_off) {
+entry:
+  %off64 = zext i32 %byte_off to i64
+  %bytep = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %off64
+  %v = load i16, ptr addrspace(1) %bytep, align 2
+  ret i16 %v
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    let load_count = module
+        .all_inst_iter()
+        .filter(|i| i.class.opcode == Op::Load)
+        .count();
+    assert_eq!(load_count, 1, "expected single 32-bit word load:\n{asm}");
+    assert!(
+        asm.contains("OpVectorExtractDynamic"),
+        "expected dynamic lane extract:\n{asm}"
+    );
+    assert!(
+        !asm.contains("OpSelect"),
+        "align 2 must not fall back to cross-word byte reassembly:\n{asm}"
+    );
+}
+
+#[test]
+fn native_raw_half_load_with_proven_align4_uses_static_lane() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define half @load_aligned4_half(ptr addrspace(1) %p, i32 %byte_off) {
+entry:
+  %off64 = zext i32 %byte_off to i64
+  %bytep = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %off64
+  %v = load half, ptr addrspace(1) %bytep, align 4
+  ret half %v
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    let load_count = module
+        .all_inst_iter()
+        .filter(|i| i.class.opcode == Op::Load)
+        .count();
+    assert_eq!(load_count, 1, "expected single 32-bit word load:\n{asm}");
+    assert!(
+        asm.contains("OpCompositeExtract"),
+        "align 4 should statically select lane 0:\n{asm}"
+    );
+    assert!(
+        !asm.contains("OpVectorExtractDynamic") && !asm.contains("OpSelect"),
+        "align 4 should avoid dynamic lane and cross-word select:\n{asm}"
+    );
+}

@@ -89,7 +89,7 @@ impl Emitter {
                 ));
             }
             LlType::Half => {
-                if !self.raw_offset_aligned_to(raw, extra_byte, 2) {
+                if !self.raw_subword_access_aligned(raw, extra_byte, 2, access_align) {
                     let bits =
                         self.emit_raw_u16_from_unaligned_bytes(raw, extra_byte, instructions)?;
                     let result_type = self.type_id(&LlType::Half)?;
@@ -104,7 +104,7 @@ impl Emitter {
                 let vec_ty = LlType::Vector(Box::new(LlType::Half), 2);
                 let vec_ty_id = self.type_id(&vec_ty)?;
                 let (word, lane) =
-                    self.emit_raw_subword_source(raw, extra_byte, 2, instructions)?;
+                    self.emit_raw_subword_source(raw, extra_byte, 2, access_align, instructions)?;
                 let tmp = self.fresh();
                 instructions.push(Self::inst(
                     Op::Bitcast,
@@ -133,7 +133,7 @@ impl Emitter {
                 }
             }
             LlType::Int(16) | LlType::BFloat => {
-                if !self.raw_offset_aligned_to(raw, extra_byte, 2) {
+                if !self.raw_subword_access_aligned(raw, extra_byte, 2, access_align) {
                     let bits =
                         self.emit_raw_u16_from_unaligned_bytes(raw, extra_byte, instructions)?;
                     let result_type = self.type_id(&LlType::Int(16))?;
@@ -148,7 +148,7 @@ impl Emitter {
                 let vec_ty = LlType::Vector(Box::new(LlType::Int(16)), 2);
                 let vec_ty_id = self.type_id(&vec_ty)?;
                 let (word, lane) =
-                    self.emit_raw_subword_source(raw, extra_byte, 2, instructions)?;
+                    self.emit_raw_subword_source(raw, extra_byte, 2, access_align, instructions)?;
                 let tmp = self.fresh();
                 instructions.push(Self::inst(
                     Op::Bitcast,
@@ -180,7 +180,7 @@ impl Emitter {
                 let vec_ty = LlType::Vector(Box::new(LlType::Int(8)), 4);
                 let vec_ty_id = self.type_id(&vec_ty)?;
                 let (word, lane) =
-                    self.emit_raw_subword_source(raw, extra_byte, 1, instructions)?;
+                    self.emit_raw_subword_source(raw, extra_byte, 1, access_align, instructions)?;
                 let tmp = self.fresh();
                 instructions.push(Self::inst(
                     Op::Bitcast,
