@@ -497,6 +497,9 @@ impl Emitter {
         let (result_type, source) = if let Some(address) = address {
             self.bda_direct_addresses
                 .insert(result_name.to_string(), result);
+            if self.bda_nonnull_addresses.contains(&address) {
+                self.bda_nonnull_addresses.insert(result);
+            }
             let mut raw = RawBufferOffset::root(format!(".bda_{result}"), *addrspace);
             raw.device_addr_base = Some(result);
             self.raw_offsets.insert(result_name.to_string(), raw);

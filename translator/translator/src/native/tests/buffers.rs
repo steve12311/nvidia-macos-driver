@@ -15050,3 +15050,100 @@ done:
         "must emit runtime address-table comparison for distinct buffer params:\n{post}"
     );
 }
+
+#[test]
+fn native_bda_proven_nonnull_loads_skip_null_helper() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %pad, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %off = mul i64 %idx, 16
+  %cond = icmp ult i32 %tid, 16
+  br i1 %cond, label %left, label %right
+
+left:
+  %p0 = getelementptr inbounds i8, ptr addrspace(1) %src, i64 %off
+  br label %merge
+
+right:
+  %p1 = getelementptr inbounds i8, ptr addrspace(1) %pad, i64 %off
+  br label %merge
+
+merge:
+  %base = phi ptr addrspace(1) [ %p0, %left ], [ %p1, %right ]
+  %v0 = load float, ptr addrspace(1) %base, align 4
+  %p_next = getelementptr inbounds i8, ptr addrspace(1) %base, i64 4
+  %v1 = load float, ptr addrspace(1) %p_next, align 4
+  %sum = fadd float %v0, %v1
+  %outp = getelementptr inbounds float, ptr addrspace(1) %dst, i64 %idx
+  store float %sum, ptr addrspace(1) %outp, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"pad"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_nonnull_direct_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(
+        !asm.contains("OpFunctionCall"),
+        "proven non-null BDA loads should emit direct PSB loads without null_bda_load_helper:\n{asm}"
+    );
+    assert!(
+        asm.matches("OpConvertUToPtr").count() >= 2,
+        "expected direct PhysicalStorageBuffer loads:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_bda_nullable_loads_keep_null_helper() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %table, ptr addrspace(1) %dst) {
+entry:
+  %raw_addr = load i64, ptr addrspace(1) %table, align 8
+  %ptr = inttoptr i64 %raw_addr to ptr addrspace(1)
+  %v = load float, ptr addrspace(1) %ptr, align 4
+  store float %v, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"table"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_nullable_guard_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(
+        asm.contains("OpINotEqual") && asm.contains("OpPhi"),
+        "nullable BDA load from inttoptr must preserve zero-return null guard:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val").arg("--version").output().is_ok() {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}

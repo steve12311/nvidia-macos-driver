@@ -78,6 +78,9 @@ impl Emitter {
         }
         let mut raw = RawBufferOffset::root(format!(".bda_phi_{name}"), *addrspace);
         raw.device_addr_base = Some(result);
+        if self.bda_phi_incoming_all_nonnull(incoming) {
+            self.bda_nonnull_addresses.insert(result);
+        }
         self.raw_offsets.insert(name.to_string(), raw);
         self.pointer_storage
             .insert(name.to_string(), StorageClass::PhysicalStorageBuffer);
@@ -97,6 +100,93 @@ impl Emitter {
 
     pub(in crate::native::emitter) fn bda_phi_value_is_addressable(&self, value: &LlValue) -> bool {
         self.bda_phi_value_is_addressable_inner(value, &mut HashSet::default())
+    }
+
+    fn bda_phi_incoming_all_nonnull(&self, incoming: &[(LlValue, String)]) -> bool {
+        if incoming.is_empty() {
+            return false;
+        }
+        let mut found_concrete = false;
+        let all_ok = incoming.iter().all(|(value, _)| {
+            self.bda_phi_value_is_nonnull_inner(value, &mut HashSet::default(), &mut found_concrete)
+        });
+        all_ok && found_concrete
+    }
+
+    fn bda_phi_value_is_nonnull_inner(
+        &self,
+        value: &LlValue,
+        visiting: &mut HashSet<String>,
+        found_concrete: &mut bool,
+    ) -> bool {
+        match value {
+            LlValue::Local(name) => {
+                if self.bda_inttoptr_sources.contains_key(name)
+                    || self.bda_address_loads.contains(name)
+                {
+                    return false;
+                }
+                if self.direct_param_indices.contains_key(name)
+                    || self
+                        .bda_direct_addresses
+                        .get(name)
+                        .is_some_and(|addr| self.bda_nonnull_addresses.contains(addr))
+                    || self.raw_offsets.get(name).is_some_and(|raw| {
+                        !raw.unmodelable
+                            && (raw
+                                .device_addr_base
+                                .is_some_and(|base| self.bda_nonnull_addresses.contains(&base))
+                                || (raw.device_addr_base.is_none()
+                                    && (self.direct_param_indices.contains_key(&raw.root)
+                                        || self.bda_direct_addresses.get(&raw.root).is_some_and(
+                                            |addr| self.bda_nonnull_addresses.contains(addr),
+                                        ))))
+                    })
+                {
+                    *found_concrete = true;
+                    return true;
+                }
+                if let Some(gep) = self.forward_geps.get(name).cloned() {
+                    if !visiting.insert(name.clone()) {
+                        return true;
+                    }
+                    let nonnull =
+                        self.bda_phi_value_is_nonnull_inner(&gep.base.value, visiting, found_concrete);
+                    visiting.remove(name);
+                    return nonnull;
+                }
+                if let Some((true_val, false_val)) = self.forward_pointer_selects.get(name).cloned()
+                {
+                    if !visiting.insert(name.clone()) {
+                        return true;
+                    }
+                    let nonnull = self.bda_phi_value_is_nonnull_inner(
+                        &true_val.value,
+                        visiting,
+                        found_concrete,
+                    ) && self.bda_phi_value_is_nonnull_inner(
+                        &false_val.value,
+                        visiting,
+                        found_concrete,
+                    );
+                    visiting.remove(name);
+                    return nonnull;
+                }
+                let Some(incoming) = self.tir_phi_incomings.get(name) else {
+                    return false;
+                };
+                if !visiting.insert(name.clone()) {
+                    return true;
+                }
+                let nonnull = !incoming.is_empty()
+                    && incoming.iter().all(|(value, _)| {
+                        self.bda_phi_value_is_nonnull_inner(value, visiting, found_concrete)
+                    });
+                visiting.remove(name);
+                nonnull
+            }
+            _ => false,
+        }
     }
 
     fn bda_phi_value_is_addressable_inner(
@@ -226,6 +316,11 @@ impl Emitter {
                         ],
                     ));
                     self.bda_address_values.insert(address);
+                    if self.bda_nonnull_addresses.contains(&true_address)
+                        && self.bda_nonnull_addresses.contains(&false_address)
+                    {
+                        self.bda_nonnull_addresses.insert(address);
+                    }
                     self.bda_direct_addresses.insert(name.clone(), address);
                     return Ok(address);
                 }

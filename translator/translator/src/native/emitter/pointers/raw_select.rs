@@ -853,6 +853,11 @@ impl Emitter {
                     ],
                 ));
                 self.bda_address_values.insert(address);
+                if self.bda_nonnull_addresses.contains(&true_addr)
+                    && self.bda_nonnull_addresses.contains(&false_addr)
+                {
+                    self.bda_nonnull_addresses.insert(address);
+                }
                 self.bda_direct_addresses.insert(name.to_string(), address);
                 let mut raw = RawBufferOffset::root(format!(".bda_{address}"), *addrspace);
                 raw.device_addr_base = Some(address);

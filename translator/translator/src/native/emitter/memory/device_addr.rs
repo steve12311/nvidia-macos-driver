@@ -284,9 +284,9 @@ impl Emitter {
                 if self.direct_param_indices.contains_key(name) {
                     let (low, high) = self.emit_direct_buffer_address_payload(name, instructions)?;
                     self.used_device_address = true;
-                    return Ok(Some(
-                        self.combine_pointer_payload_words(low, high, instructions)?,
-                    ));
+                    let addr = self.combine_pointer_payload_words(low, high, instructions)?;
+                    self.bda_nonnull_addresses.insert(addr);
+                    return Ok(Some(addr));
                 }
                 if self.pointer_storage.get(name) == Some(&StorageClass::PhysicalStorageBuffer) {
                     if let Some(ptr_id) = self.values.get(name).map(|(id, _)| *id) {
@@ -319,10 +319,13 @@ impl Emitter {
             base
         } else if self.direct_param_indices.contains_key(&raw.root) {
             let (low, high) = self.emit_direct_buffer_address_payload(&raw.root, instructions)?;
-            self.combine_pointer_payload_words(low, high, instructions)?
+            let combined = self.combine_pointer_payload_words(low, high, instructions)?;
+            self.bda_nonnull_addresses.insert(combined);
+            combined
         } else {
             return Err("native emitter: device address offset has no base".to_string());
         };
+        let base_nonnull = self.bda_nonnull_addresses.contains(&base);
         let i64_ty = self.type_id(&LlType::Int(64))?;
         let mut addr = base;
         if raw.const_off != 0 {
@@ -374,6 +377,9 @@ impl Emitter {
             ));
             addr = sum;
         }
+        if base_nonnull {
+            self.bda_nonnull_addresses.insert(addr);
+        }
         Ok(addr)
     }
 
@@ -396,6 +402,9 @@ impl Emitter {
                 Some(reserved),
                 vec![Operand::IdRef(address)],
             ));
+        }
+        if self.bda_nonnull_addresses.contains(&address) {
+            self.bda_nonnull_addresses.insert(reserved);
         }
         self.bda_address_values.insert(reserved);
         Ok(())
@@ -444,6 +453,17 @@ impl Emitter {
             .ok_or("native emitter: device load has no base")?;
         let result_ty = self.type_id(ty)?;
         let align = self.device_addr_align_for_access(ty, access_align);
+        // 证明非空的 BDA 基址无需逐次经由 null_bda_load_helper 做空指针分支，直接发射加载
+        if self.bda_nonnull_addresses.contains(&base) {
+            let loaded = self.emit_psb_load_value(ty, addr, align, instructions)?;
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(result_ty),
+                Some(result),
+                vec![Operand::IdRef(loaded)],
+            ));
+            return Ok(());
+        }
         let helper = self.null_bda_load_helper(ty, align)?;
         instructions.push(Self::inst(
             Op::FunctionCall,

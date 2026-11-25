@@ -416,6 +416,7 @@ impl Emitter {
         self.bda_forward_addresses.clear();
         self.bda_pointer_tables.clear();
         self.bda_direct_addresses.clear();
+        self.bda_nonnull_addresses.clear();
         self.bda_aggregate_addresses.clear();
         self.aggregate_pointer_values.clear();
         self.opaque_resource_pointers = self
@@ -620,15 +621,18 @@ impl Emitter {
                     llvm_pointer_storage(addrspace)?
                 };
                 self.pointer_storage.insert(name.clone(), storage);
-                if bda_data_buffer_parameter {
-                    self.bda_direct_addresses.insert(name.clone(), id);
-                    self.used_device_address = true;
-                }
-                if self.ir.entry_functions.contains(&f.name)
+                let param_known_nonnull = self.ir.entry_functions.contains(&f.name)
                     || self
                         .function_param_nonnull
-                        .contains(&(f.name.clone(), param_index))
-                {
+                        .contains(&(f.name.clone(), param_index));
+                if bda_data_buffer_parameter {
+                    self.bda_direct_addresses.insert(name.clone(), id);
+                    if param_known_nonnull {
+                        self.bda_nonnull_addresses.insert(id);
+                    }
+                    self.used_device_address = true;
+                }
+                if param_known_nonnull {
                     let is_null = self.const_bool(false)?;
                     self.record_pointer_nullness(name.clone(), is_null);
                 }
@@ -679,6 +683,9 @@ impl Emitter {
                         && !self.ir.entry_functions.contains(&f.name)
                     {
                         raw.device_addr_base = Some(id);
+                        if param_known_nonnull {
+                            self.bda_nonnull_addresses.insert(id);
+                        }
                         self.used_device_address = true;
                         self.pointer_storage
                             .insert(name.clone(), StorageClass::PhysicalStorageBuffer);

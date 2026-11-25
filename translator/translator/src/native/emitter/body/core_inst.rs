@@ -930,9 +930,12 @@ impl Emitter {
             ops,
         ));
         if let LlType::Ptr(addrspace) = result_ty {
-            if self.bda_direct_addresses.contains_key(&name) {
+            if let Some(source_address) = self.bda_direct_addresses.get(&name).copied() {
                 let mut raw = RawBufferOffset::root(format!(".bda_{result}"), addrspace);
                 raw.device_addr_base = Some(result);
+                if self.bda_nonnull_addresses.contains(&source_address) {
+                    self.bda_nonnull_addresses.insert(result);
+                }
                 self.raw_offsets.insert(name.clone(), raw);
                 self.pointer_storage
                     .insert(name, StorageClass::PhysicalStorageBuffer);
