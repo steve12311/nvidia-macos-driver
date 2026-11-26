@@ -1,0 +1,214 @@
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -3025,6 +3025,7 @@
+    unsigned step;
+    nir_intrinsic_instr *loads[6];
+    unsigned nloads;
++   bool post_test;
+ };
+ 
+ struct nak_cg_swpipe_slice_ctx {
+@@ -3071,6 +3072,28 @@
+       }
+    }
+    return true;
++}
++
++static bool
++nak_cg_swpipe_affine_step(nir_phi_instr *phi, nir_block *back, uint64_t *step)
++{
++   nir_def *update = nir_phi_get_src_from_block(phi, back)->src.ssa;
++   nir_instr *instr = nir_def_instr(update);
++   if (phi->def.num_components != 1 || instr->type != nir_instr_type_alu)
++      return false;
++
++   nir_alu_instr *add = nir_instr_as_alu(instr);
++   if (add->op != nir_op_iadd)
++      return false;
++
++   for (unsigned i = 0; i < 2; i++) {
++      if (add->src[i].src.ssa == &phi->def && add->src[i].swizzle[0] == 0 &&
++          nir_src_is_const(add->src[1 - i].src)) {
++         *step = nir_alu_src_as_uint(add->src[1 - i]);
++         return true;
++      }
++   }
++   return false;
+ }
+ 
+ static bool
+@@ -3117,7 +3140,7 @@
+             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+             if (intr->intrinsic == nir_intrinsic_load_global ||
+                 intr->intrinsic == nir_intrinsic_load_global_constant) {
+-               if (nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_COHERENT))
++               if (nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_ATOMIC))
+                   return false;
+                total_loads++;
+                total_cost++;
+@@ -3138,10 +3161,8 @@
+          }
+       }
+    }
+-   /* Only handle larger compute loops that punroll skipped, while bounding register/code pressure. */
+-   if (total_loads == 0 || total_cost <= 48 || total_cost > 512)
+-      return false;
+-   if (!nak_cg_swpipe_no_external_uses(a, a, z) || !nak_cg_swpipe_no_external_uses(z, a, z))
++   /* 小循环由部分展开处理。 */
++   if (total_loads == 0 || total_cost <= 48)
+       return false;
+ 
+    nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
+@@ -3164,24 +3185,46 @@
+    unsigned d = 0, step = 1;
+    nir_phi_instr *iv = nak_cg_punroll_counter(a, z, cmp->src[0].src.ssa, &d, &step);
+    nir_def *n = cmp->src[1].src.ssa;
+-   if (iv == NULL || d != 0 || n->bit_size != 32 || n->num_components != 1)
+-      return false;
+-   if (nir_def_block(n)->index >= nir_loop_first_block(loop)->index)
+-      return false;
+-
+-   /* Collect pure IV/invariant-dependent global loads in z whose access width <= alignment. */
++   if (iv == NULL || n->bit_size != 32 || n->num_components != 1)
++      return false;
++   if (nir_def_block(n)->index >= a->index)
++      return false;
++
++   /* 后测循环原地改写，只复制选中加载的地址计算。 */
++   const bool post_test = d == 1;
++   if (!post_test && (total_cost > 512 || !nak_cg_swpipe_no_external_uses(a, a, z) ||
++                      !nak_cg_swpipe_no_external_uses(z, a, z)))
++      return false;
++
+    struct set *allowed = _mesa_pointer_set_create(NULL);
++   if (post_test) {
++      nir_foreach_phi(phi, a) {
++         uint64_t step;
++         if (nak_cg_swpipe_affine_step(phi, z, &step))
++            _mesa_set_add(allowed, &phi->instr);
++      }
++   }
++
+    struct nak_cg_swpipe_slice_ctx sctx = { a, z, &iv->def, allowed, true };
+    unsigned nloads = 0;
+    for (unsigned bi = 0; bi < 2; bi++) {
+       nir_foreach_instr(instr, blks[bi]) {
++         bool invariant_cbuf = false;
++         if (post_test && instr->type == nir_instr_type_intrinsic) {
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            invariant_cbuf = intr->intrinsic == nir_intrinsic_ldc_nv &&
++                             nir_intrinsic_can_reorder(intr) &&
++                             nir_def_block(intr->src[0].ssa)->index < a->index &&
++                             nir_def_block(intr->src[1].ssa)->index < a->index;
++         }
+          if (instr->type == nir_instr_type_alu || instr->type == nir_instr_type_load_const ||
+-             instr->type == nir_instr_type_undef) {
++             instr->type == nir_instr_type_undef || invariant_cbuf) {
+             sctx.ok = true;
+             nir_foreach_src(instr, nak_cg_swpipe_check_src, &sctx);
+             if (sctx.ok)
+                _mesa_set_add(allowed, instr);
+-         } else if (bi == 1 && instr->type == nir_instr_type_intrinsic && nloads < max_loads) {
++         } else if (blks[bi] == (post_test ? a : z) && instr->type == nir_instr_type_intrinsic &&
++                    nloads < max_loads) {
+             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+             if (intr->intrinsic != nir_intrinsic_load_global &&
+                 intr->intrinsic != nir_intrinsic_load_global_constant)
+@@ -3208,6 +3251,7 @@
+    p->exit_op = op;
+    p->step = step;
+    p->nloads = nloads;
++   p->post_test = post_test;
+    return true;
+ }
+ 
+@@ -3241,6 +3285,69 @@
+    if (nir_intrinsic_has_base(intr))
+       nir_intrinsic_set_base(nv, nir_intrinsic_base(intr));
+    return res;
++}
++
++static void
++nak_cg_swpipe_post_loads(nir_builder *b, struct nak_cg_swpipe_plan *p, nir_block *pre,
++                        bool next, const struct set *slice, nir_def **loads)
++{
++   struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
++   nir_foreach_phi(phi, p->a) {
++      uint64_t step;
++      if (!nak_cg_swpipe_affine_step(phi, p->z, &step))
++         continue;
++      nir_def *value = next ? nir_iadd_imm(b, &phi->def, step) :
++                             nir_phi_get_src_from_block(phi, pre)->src.ssa;
++      _mesa_hash_table_insert(remap, &phi->def, value);
++   }
++
++   nir_def *pred = nir_imm_true(b);
++   if (next) {
++      nir_def *iv = nak_cg_punroll_remap(remap, &p->iv->def);
++      pred = p->exit_op == nir_op_ige ? nir_ilt(b, iv, p->n) : nir_ult(b, iv, p->n);
++   }
++
++   nir_foreach_instr(instr, p->a) {
++      if (_mesa_set_search(slice, instr))
++         nir_builder_instr_insert(b, nir_instr_clone_deep(b->shader, instr, remap));
++   }
++   for (unsigned i = 0; i < p->nloads; i++) {
++      nir_intrinsic_instr *load = p->loads[i];
++      nir_def *addr = nak_cg_punroll_remap(remap, load->src[0].ssa);
++      loads[i] = nak_cg_swpipe_emit_pred_load(b, load, addr, pred);
++   }
++   _mesa_hash_table_destroy(remap, NULL);
++}
++
++static bool
++nak_cg_swpipe_apply_post(nir_shader *nir, struct nak_cg_swpipe_plan *p)
++{
++   struct set *slice = _mesa_pointer_set_create(NULL);
++   for (unsigned i = 0; i < p->nloads; i++)
++      nak_cg_swpipe_collect_addr_slice(nir_def_instr(p->loads[i]->src[0].ssa), p->a, p->z, slice);
++   if (slice->entries > 32) {
++      _mesa_set_destroy(slice, NULL);
++      return false;
++   }
++
++   nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&p->loop->cf_node));
++   nir_builder b = nir_builder_at(nir_before_cf_node(&p->loop->cf_node));
++   nir_def *init_loads[ARRAY_SIZE(p->loads)], *next_loads[ARRAY_SIZE(p->loads)];
++   nak_cg_swpipe_post_loads(&b, p, pre, false, slice, init_loads);
++   b.cursor = nir_after_phis(p->a);
++   nak_cg_swpipe_post_loads(&b, p, pre, true, slice, next_loads);
++   _mesa_set_destroy(slice, NULL);
++
++   for (unsigned i = 0; i < p->nloads; i++) {
++      nir_def *def = &p->loads[i]->def;
++      nir_phi_instr *phi = nir_phi_instr_create(nir);
++      nir_def_init(&phi->instr, &phi->def, def->num_components, def->bit_size);
++      nir_phi_instr_add_src(phi, pre, init_loads[i]);
++      nir_phi_instr_add_src(phi, p->z, next_loads[i]);
++      nir_instr_insert(nir_after_phis(p->a), &phi->instr);
++      nir_def_replace(def, &phi->def);
++   }
++   return true;
+ }
+ 
+ static void
+@@ -3412,9 +3519,16 @@
+              nak_cg_swpipe_plan_loop(nir_cf_node_as_loop(parent), &plans[np]))
+             np++;
+       }
+-      for (unsigned i = 0; i < np; i++)
+-         nak_cg_swpipe_apply(nir, &plans[i]);
+-      progress |= nir_progress(np > 0, impl, nir_metadata_none);
++      bool changed = false;
++      for (unsigned i = 0; i < np; i++) {
++         if (plans[i].post_test) {
++            changed |= nak_cg_swpipe_apply_post(nir, &plans[i]);
++         } else {
++            nak_cg_swpipe_apply(nir, &plans[i]);
++            changed = true;
++         }
++      }
++      progress |= nir_progress(changed, impl, nir_metadata_none);
+    }
+    return progress;
+ }

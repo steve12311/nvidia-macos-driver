@@ -10,6 +10,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PATCH = ROOT / "nvk/nvk-macos.patch"
 LATE_SPLIT = ROOT / "nvk/nvk-nak-late-split.patch"
+POST_TEST = ROOT / "nvk/nvk-nak-post-test-swpipe.patch"
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)")
 
 fails = 0
@@ -76,6 +77,9 @@ arm("nvk-macos.patch nak_nir.c hunks have exact counts and cumulative offsets", 
 
 ok2, info2 = validate_file_hunks(LATE_SPLIT, "src/nouveau/compiler/nak_nir.c")
 arm("nvk-nak-late-split.patch hunks have exact counts and cumulative offsets", ok2, str(info2))
+
+ok3, info3 = validate_file_hunks(POST_TEST, "src/nouveau/compiler/nak_nir.c")
+arm("post-test pipeline patch has exact hunk counts and cumulative offsets", ok3, str(info3))
 
 patch_text = PATCH.read_text()
 arm("nak_cg_swpipe exists with NVMTL_NAK_NO_SWPIPE kill switch and scoreboard load cap",
@@ -163,6 +167,40 @@ static int check_overflow_bounds(void) {
     return 0;
 }
 
+static bool post_test_continue(uint32_t next, uint32_t end, bool signed_iv) {
+    uint32_t sign_bit = signed_iv ? UINT32_C(1) << 31 : 0;
+    return (next ^ sign_bit) < (end ^ sign_bit);
+}
+
+static float run_post_test(const float *buf, int len, uint32_t end) {
+    uint32_t iv = 0, ptr = 1;
+    float value = safe_pred_load(buf, len, ptr, true), sum = 0;
+    for (;;) {
+        iv += 4;
+        ptr += 3;
+        bool has_next = post_test_continue(iv, end, false);
+        float prefetched = safe_pred_load(buf, len, ptr, has_next);
+        sum += value;
+        if (!has_next)
+            return sum;
+        value = prefetched;
+    }
+}
+
+static int check_post_test(const float *buf) {
+    float expected = 0;
+    for (uint32_t trips = 1; trips <= 20; trips++) {
+        int len = (int)(trips * 3 - 1);
+        expected += buf[len - 1];
+        if (run_post_test(buf, len, trips * 4) != expected || oob_accesses)
+            return 4;
+    }
+    if (!post_test_continue((uint32_t)INT32_MAX + 2u, INT32_MAX, true) ||
+        !post_test_continue((UINT32_MAX - 1u) + 4u, UINT32_MAX, false))
+        return 5;
+    return 0;
+}
+
 int main(void) {
     float a[64], b[64];
     for (int i = 0; i < 64; i++) {
@@ -185,7 +223,8 @@ int main(void) {
             }
         }
     }
-    return check_overflow_bounds();
+    int rc = check_overflow_bounds();
+    return rc ? rc : check_post_test(a);
 }
 """
 
@@ -195,7 +234,7 @@ with tempfile.TemporaryDirectory() as d:
     src.write_text(MODEL_C)
     subprocess.run([cc, "-O2", "-Wall", "-Werror", "-o", str(exe), str(src)], check=True)
     res = subprocess.run([str(exe)])
-    arm("C model matches reference for trips 0..32, strides 1/2/4/7, zero OOB loads, and overflow edges",
+    arm("C models cover pre/post-tested loops, independent strides, suppressed final loads and wraparound",
         res.returncode == 0, f"rc={res.returncode}")
 
 print("FAILED" if fails else "PASS")
