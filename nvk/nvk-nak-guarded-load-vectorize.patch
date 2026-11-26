@@ -1,0 +1,233 @@
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -3454,6 +3454,216 @@
+    return nir_shader_intrinsics_pass(nir, split_wide_global_load, nir_metadata_control_flow, NULL);
+ }
+ 
++enum {
++   NAK_GUARDED_LOAD_LIMIT = 64,
++   NAK_GUARDED_LOAD_SPAN = 1024,
++};
++
++struct nak_guarded_load {
++   nir_intrinsic_instr *load;
++   nir_def *root;
++   uint64_t offset, scale;
++};
++
++static bool
++nak_guarded_load_parse(nir_instr *instr, struct nak_guarded_load *entry)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++   nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
++   if (load->intrinsic != nir_intrinsic_load_global_nv || load->def.num_components != 1 ||
++       (load->def.bit_size != 16 && load->def.bit_size != 32) ||
++       !nir_src_is_const(load->src[2]) || !nir_src_as_bool(load->src[2]))
++      return false;
++
++   const unsigned access = nir_intrinsic_access(load);
++   /* 同一基本块内只提前发出可重排的读取。 */
++   if (!(access & ACCESS_CAN_REORDER) || (access & (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_ATOMIC)))
++      return false;
++
++   nir_def *root = load->src[0].ssa;
++   if (root->bit_size != 32 && root->bit_size != 64)
++      return false;
++   uint64_t offset = 0, scale = 1;
++   while (true) {
++      nir_instr *addr = nir_def_instr(root);
++      if (addr->type != nir_instr_type_alu)
++         break;
++      nir_alu_instr *alu = nir_instr_as_alu(addr);
++      if (alu->def.num_components != 1)
++         break;
++      if (alu->op == nir_op_mov && alu->src[0].swizzle[0] == 0 &&
++          alu->src[0].src.ssa->num_components == 1) {
++         root = alu->src[0].src.ssa;
++         continue;
++      }
++      if (alu->op == nir_op_ishl && nir_src_is_const(alu->src[1].src) &&
++          alu->src[0].swizzle[0] == 0 && alu->src[0].src.ssa->num_components == 1) {
++         scale <<= nir_alu_src_as_uint(alu->src[1]) & (root->bit_size - 1);
++         root = alu->src[0].src.ssa;
++         continue;
++      }
++      /* 晚期代数优化可将 (x << 1) + c 改写为 iadd3(x, x, c)。 */
++      if (alu->op == nir_op_iadd3 && nir_src_is_const(alu->src[2].src) &&
++          alu->src[0].src.ssa == alu->src[1].src.ssa && alu->src[0].swizzle[0] == 0 &&
++          alu->src[1].swizzle[0] == 0 && alu->src[0].src.ssa->num_components == 1) {
++         offset += nir_alu_src_as_uint(alu->src[2]) * scale;
++         scale *= 2;
++         root = alu->src[0].src.ssa;
++         continue;
++      }
++      if (alu->op != nir_op_iadd)
++         break;
++      unsigned c = nir_src_is_const(alu->src[0].src) ? 0 : 1;
++      if (!nir_src_is_const(alu->src[c].src) || alu->src[1 - c].swizzle[0] != 0 ||
++          alu->src[1 - c].src.ssa->num_components != 1)
++         break;
++      offset += nir_alu_src_as_uint(alu->src[c]) * scale;
++      root = alu->src[1 - c].src.ssa;
++   }
++   *entry = (struct nak_guarded_load){ load, root, offset, scale };
++   return true;
++}
++
++static uint64_t
++nak_guarded_load_delta(struct nak_guarded_load entry, struct nak_guarded_load first)
++{
++   nir_intrinsic_instr *a = entry.load, *b = first.load;
++   if (!a || entry.root != first.root || entry.scale != first.scale ||
++       a->def.bit_size != b->def.bit_size ||
++       a->src[1].ssa != b->src[1].ssa || nir_intrinsic_base(a) != nir_intrinsic_base(b) ||
++       nir_intrinsic_access(a) != nir_intrinsic_access(b))
++      return UINT64_MAX;
++
++   uint64_t delta = entry.offset - first.offset;
++   return first.root->bit_size == 32 ? (uint32_t)delta : delta;
++}
++
++static nir_def *
++nak_guarded_load_emit(nir_builder *b, nir_intrinsic_instr *old, nir_def *addr,
++                     unsigned num_components, unsigned bit_size, unsigned align)
++{
++   nir_def *def = nir_load_global_nv(b, num_components, bit_size, addr, old->src[1].ssa,
++                                     nir_imm_true(b));
++   nir_intrinsic_instr *load = nir_def_as_intrinsic(def);
++   nir_intrinsic_set_access(load, nir_intrinsic_access(old));
++   nir_intrinsic_set_base(load, nir_intrinsic_base(old));
++   nir_intrinsic_set_align_mul(load, align);
++   nir_intrinsic_set_align_offset(load, 0);
++   return def;
++}
++
++struct nak_guarded_load_chunk {
++   unsigned index[4];
++   unsigned delta;
++};
++
++static bool
++nak_guarded_load_pack(struct nak_guarded_load *entries, unsigned n, unsigned start)
++{
++   const struct nak_guarded_load first = entries[start];
++   if (!first.load)
++      return false;
++   const unsigned bits = first.load->def.bit_size;
++   const unsigned bytes = bits / 8;
++   const unsigned lanes = bits == 16 ? 2 : 4;
++   if (n - start < 2 * lanes)
++      return false;
++   const unsigned width = lanes * bytes;
++   uint8_t indices[NAK_GUARDED_LOAD_SPAN / 2] = {0};
++   for (unsigned i = start; i < n; i++) {
++      const uint64_t delta = nak_guarded_load_delta(entries[i], first);
++      if (delta < NAK_GUARDED_LOAD_SPAN && delta % bytes == 0 && !indices[delta / bytes])
++         indices[delta / bytes] = i + 1;
++   }
++
++   struct nak_guarded_load_chunk chunks[NAK_GUARDED_LOAD_LIMIT / 2];
++   unsigned nchunks = 0, max_delta = 0;
++   for (unsigned delta = 0; delta < NAK_GUARDED_LOAD_SPAN; delta += width) {
++      const uint8_t *group = &indices[delta / bytes];
++      bool complete = true;
++      for (unsigned l = 0; l < lanes; l++)
++         complete &= group[l] != 0;
++      if (!complete)
++         continue;
++
++      struct nak_guarded_load_chunk *chunk = &chunks[nchunks++];
++      chunk->delta = delta;
++      for (unsigned l = 0; l < lanes; l++)
++         chunk->index[l] = group[l] - 1;
++      max_delta = delta + width - bytes;
++   }
++   /* 至少合并两组，让它们分摊一次对齐检查。 */
++   if (nchunks < 2 || chunks[0].delta != 0)
++      return false;
++
++   nir_builder b = nir_builder_at(nir_before_instr(&first.load->instr));
++   nir_def *addr = first.load->src[0].ssa;
++   nir_def *low = nir_iadd(&b, nir_u2u32(&b, addr), nir_u2u32(&b, first.load->src[1].ssa));
++   low = nir_iadd_imm(&b, low, nir_intrinsic_base(first.load));
++   nir_def *aligned = nir_ieq_imm(&b, nir_iand_imm(&b, low, width - 1), 0);
++   /* 32 位偏移先回绕再与基址相加。发生回绕时逐项保留原来的地址。 */
++   if (addr->bit_size == 32) {
++      nir_def *limit = nir_imm_int(&b, UINT32_MAX - max_delta);
++      aligned = nir_iand(&b, aligned, nir_inot(&b, nir_ult(&b, limit, addr)));
++   }
++
++   nir_def *wide[ARRAY_SIZE(chunks)][4], *narrow[ARRAY_SIZE(chunks)][4];
++   nir_push_if(&b, aligned);
++   for (unsigned c = 0; c < nchunks; c++) {
++      nir_def *ptr = nir_iadd_imm(&b, addr, chunks[c].delta);
++      nir_def *vec = nak_guarded_load_emit(&b, first.load, ptr, width / 4, 32, width);
++      if (bits == 16) {
++         wide[c][0] = nir_unpack_32_2x16_split_x(&b, vec);
++         wide[c][1] = nir_unpack_32_2x16_split_y(&b, vec);
++      } else {
++         for (unsigned l = 0; l < lanes; l++)
++            wide[c][l] = nir_channel(&b, vec, l);
++      }
++   }
++   nir_push_else(&b, NULL);
++   for (unsigned c = 0; c < nchunks; c++) {
++      for (unsigned l = 0; l < lanes; l++) {
++         nir_def *ptr = nir_iadd_imm(&b, addr, chunks[c].delta + l * bytes);
++         nir_intrinsic_instr *old = entries[chunks[c].index[l]].load;
++         narrow[c][l] = nak_guarded_load_emit(&b, old, ptr, 1, bits, nir_intrinsic_align(old));
++      }
++   }
++   nir_pop_if(&b, NULL);
++   for (unsigned c = 0; c < nchunks; c++) {
++      for (unsigned l = 0; l < lanes; l++) {
++         struct nak_guarded_load *entry = &entries[chunks[c].index[l]];
++         nir_def *merged = nir_if_phi(&b, wide[c][l], narrow[c][l]);
++         nir_def_replace(&entry->load->def, merged);
++         entry->load = NULL;
++      }
++   }
++   return true;
++}
++
++static bool
++nak_nir_guarded_loads(nir_shader *nir)
++{
++   if (nir->info.stage != MESA_SHADER_COMPUTE)
++      return false;
++   bool progress = false;
++   nir_foreach_function_impl(impl, nir) {
++      bool changed = false;
++      nir_foreach_block_safe(block, impl) {
++         struct nak_guarded_load entries[NAK_GUARDED_LOAD_LIMIT];
++         unsigned n = 0;
++         nir_foreach_instr(instr, block) {
++            if (nak_guarded_load_parse(instr, &entries[n]) && ++n == ARRAY_SIZE(entries))
++               break;
++         }
++         for (unsigned i = 0; i < n; i++)
++            changed |= nak_guarded_load_pack(entries, n, i);
++      }
++      progress |= nir_progress(changed, impl, nir_metadata_none);
++   }
++   return progress;
++}
++
+ void
+ nak_postprocess_nir(nir_shader *nir,
+                     const struct nak_compiler *nak,
+@@ -3793,6 +4003,13 @@
+    if (NAK_CAN_PRINTF)
+       OPT(nir, nak_nir_lower_printf, nak);
+ 
++   /* LDCX 降级后，全局基址与相邻读取的偏移可以分别匹配。 */
++   if (!raw_pressure && nak->sm >= 73 && OPT(nir, nak_nir_guarded_loads)) {
++      OPT(nir, nir_opt_constant_folding);
++      OPT(nir, nir_opt_dce);
++      OPT(nir, nir_convert_to_lcssa, false, false);
++   }
++
+    /* Call divergence analysis regardless of sm version. */
+    nir_divergence_analysis(nir);
+ 
