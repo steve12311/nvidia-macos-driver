@@ -1,0 +1,114 @@
+--- a/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_prepass.rs
+@@ -21,6 +21,7 @@
+ /// Target number of free GPRs. This is used for the threshold to switch to
+ /// scheduling for register pressure
+ const TARGET_FREE: i32 = 4;
++const PRESSURE_RETRY_MIN_INSTRS: usize = 48;
+ 
+ /// Typically using an extra register is free... until you hit a threshold where
+ /// one more register causes occupancy to plummet. This function figures out how
+@@ -340,7 +341,7 @@
+     (badness, goodness)
+ }
+ 
+-type Score = (bool, Reverse<i32>, i32);
++type Score = (bool, Reverse<i32>, Reverse<i32>, i32);
+ fn calc_score(
+     net: PerRegFile<i32>,
+     peak1: PerRegFile<i32>,
+@@ -355,13 +356,18 @@
+     );
+     let instruction_usable = peak_gprs <= thresholds.quit_threshold;
+     if !instruction_usable {
+-        return (false, Reverse(0), 0);
+-    }
+-
++        return (false, Reverse(0), Reverse(0), 0);
++    }
++
++    let pressure = if thresholds.pressure_first {
++        calc_used_gprs(net, max_regs)
++    } else {
++        0
++    };
+     let (mut badness, goodness) = calc_score_part(net, max_regs);
+     badness += i32::try_from(delay_cycles).unwrap();
+ 
+-    (true, Reverse(badness), goodness)
++    (true, Reverse(pressure), Reverse(badness), goodness)
+ }
+ 
+ #[derive(Copy, Clone)]
+@@ -371,6 +377,8 @@
+ 
+     /// Give up if we use this many gprs
+     quit_threshold: i32,
++
++    pressure_first: bool,
+ }
+ 
+ struct GenerateOrder<'a> {
+@@ -511,8 +519,8 @@
+             }
+ 
+             // Pick an instruction to schedule
+-            let next_idx = if used_regs[RegFile::GPR]
+-                <= thresholds.heuristic_threshold
++            let next_idx = if !thresholds.pressure_first
++                && used_regs[RegFile::GPR] <= thresholds.heuristic_threshold
+                 && used_regs[RegFile::Pred] < self.max_regs[RegFile::Pred]
+             {
+                 let ReadyInstr { index, .. } = ready_instrs.pop_last().unwrap();
+@@ -718,14 +726,28 @@
+             .get_or_insert_with(|| ScheduleUnitGraph::new(sm, &self.instrs));
+ 
+         self.last_tried_schedule_type = Some(schedule_type);
+-        let new_order = sched_buffer(
+-            max_regs,
+-            &self.instrs,
+-            graph,
+-            self.live_in_count.unwrap(),
+-            self.live_out.as_ref().unwrap(),
+-            thresholds,
+-        );
++        let schedule = |thresholds| {
++            sched_buffer(
++                max_regs,
++                &self.instrs,
++                graph,
++                self.live_in_count.unwrap(),
++                self.live_out.as_ref().unwrap(),
++                thresholds,
++            )
++        };
++        let new_order = schedule(thresholds).or_else(|| {
++            if self.instrs.len() < PRESSURE_RETRY_MIN_INSTRS
++                || !matches!(schedule_type, ScheduleType::RegLimit(_))
++            {
++                return None;
++            }
++            // 提高寄存器上限前，优先尝试缩短通用寄存器的活跃区间。
++            schedule(ScheduleThresholds {
++                pressure_first: true,
++                ..thresholds
++            })
++        });
+ 
+         if let Some(x) = new_order {
+             self.new_order = Some(x);
+@@ -767,12 +789,14 @@
+             ScheduleType::RegLimit(gpr_target) => ScheduleThresholds {
+                 heuristic_threshold: i32::from(*gpr_target) - TARGET_FREE,
+                 quit_threshold: i32::from(*gpr_target),
++                pressure_first: false,
+             },
+             ScheduleType::Spill => ScheduleThresholds {
+                 heuristic_threshold: max_regs[RegFile::GPR]
+                     - SW_RESERVED_GPRS_SPILL
+                     - TARGET_FREE,
+                 quit_threshold: schedule_unit.peak_gpr_count,
++                pressure_first: false,
+             },
+         }
+     }
